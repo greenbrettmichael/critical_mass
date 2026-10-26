@@ -68,6 +68,7 @@ class Thing:
 	var burn := 0.0
 	var pounce := 0.0       # apex pounce wind-up
 	var pounce_cd := 0.0
+	var calm := 0.0         # apex backs off after a strike
 	var dmg_by := {}        # apex/rival damage attribution, for tuning
 	var feelers := []       # the rival's feeding tentacles
 
@@ -94,6 +95,7 @@ class Bullet:
 	var power := 1.0
 	var turn := 0.0
 	var hit := {}
+	var src := ""
 
 var rng := RandomNumberGenerator.new()
 var run_len := 20.0 * 60.0
@@ -199,6 +201,7 @@ var dust := []
 var sparks := []
 var banners := []
 var shake := 0.0
+var hurt_vignette := 0.0
 var shake_off := Vector2.ZERO
 
 # --- camera ---
@@ -215,6 +218,7 @@ var card_rects := []
 var dmg_src := ""       # tag for whatever is dealing player damage right now
 var choice_wait := 0
 var bot_focus := ""
+var apex_test := false   # debug: drop the zone apex next to an idle player and log its hits
 var choice_hold := 20     # physics frames the autopilot lingers on a fork
 
 var prop_sorted: Array = []
@@ -246,6 +250,7 @@ func _ready() -> void:
 			"start_t": t = float(v)
 			"choice_hold": choice_hold = int(v)
 			"bot_focus": bot_focus = v
+			"apex_test": apex_test = true
 	rng.seed = seed_v
 	if bot_mode:
 		bot = Bot.new()
@@ -281,7 +286,13 @@ func _ready() -> void:
 	for i in 10:
 		spawn_enemy()
 	syn_seen = syn_active.duplicate()
-	if start_r <= R0:
+	if apex_test and not apexes.is_empty():
+		var ax: Thing = apexes[0]
+		ax.pos = ppos + Vector2(R * 7.0 + ax.r, 0)
+		ax.state = 1
+		ax.st = 999.0
+		pending.clear()
+	if start_r <= R0 and not apex_test:
 		_queue_start_choice()
 
 
@@ -333,6 +344,9 @@ func _physics_process(dt: float) -> void:
 	screen = get_viewport_rect().size
 	if not pending.is_empty():
 		# the game pauses while a tree fork is on screen
+		if apex_test:
+			_choose(0)
+			return
 		if bot != null:
 			# linger a moment so screenshots can catch the fork
 			choice_wait += 1
@@ -380,7 +394,7 @@ func _physics_process(dt: float) -> void:
 		end_t += dt
 		if bot_mode and end_t > 3.0 and end_t - dt <= 3.0:
 			_take_shot("final")
-		if bot_mode and end_t > 3.5:
+		if (bot_mode or apex_test) and end_t > 3.5:
 			_print_log()
 			get_tree().quit()
 	if quit_after > 0 and t >= quit_after:
@@ -1132,22 +1146,10 @@ func shed(k: int, world_ang: float) -> void:
 	surf.sort_custom(func(a, b): return absf(angle_difference(local, a.ang)) < absf(angle_difference(local, b.ang)))
 	# Only the live outer layer is armor. Run out of it and the core takes the hit.
 	var taken: Array = surf.slice(0, k)
-	var breach := taken.size() < k
-	if breach:
-		integrity -= 1.0
-		stats["core_hits"] += 1
-		iframes = 1.6
-		# core flare: shove everything away so a breach is survivable
-		for e: Thing in query(ppos, R * 5.0):
-			if e != boss and not e.apex:
-				e.vel += (e.pos - ppos).normalized() * R * 14.0
-		ring(ppos, R * 5.0, Color(1, 0.2, 0.2), 0.5)
-		shake = maxf(shake, 0.8)
-		text(ppos + Vector2(0, -R * 1.6), "CORE BREACH", Color(1, 0.3, 0.3), 20)
-		if integrity <= 0.0:
-			game_over = true
-			print("DEFEAT at T=%.1f" % t)
-			banner("SINGULARITY COLLAPSED", "R to restart")
+	if taken.size() < k:
+		_core_breach("CORE BREACH")
+	if not taken.is_empty():
+		text(ppos + Vector2.from_angle(world_ang) * R * 1.3, "-%d" % taken.size(), Color(1.0, 0.35, 0.3), 14 + 3 * mini(taken.size(), 4))
 	var life := 10.0 if has("metal.riveted") else LOOSE_TIME
 	for it: HullItem in taken:
 		items.erase(it)
@@ -1165,6 +1167,44 @@ func shed(k: int, world_ang: float) -> void:
 		stats["shed"] += 1
 	_resurface()
 	recompute_size()
+
+
+func _core_breach(label: String) -> void:
+	integrity -= 1.0
+	stats["core_hits"] += 1
+	iframes = 1.6
+	# core flare: shove everything small away so a breach is survivable
+	for e: Thing in query(ppos, R * 5.0):
+		if e != boss and not e.apex:
+			e.vel += (e.pos - ppos).normalized() * R * 14.0
+	ring(ppos, R * 5.0, Color(1, 0.2, 0.2), 0.5)
+	shake = maxf(shake, 0.9)
+	hurt_vignette = 0.6
+	text(ppos + Vector2(0, -R * 1.6), label, Color(1, 0.3, 0.3), 22)
+	if integrity <= 0.0:
+		game_over = true
+		print("DEFEAT at T=%.1f (%s)" % [t, label])
+		banner("SINGULARITY COLLAPSED", "R to restart")
+
+
+func _apex_strike(e: Thing) -> void:
+	# An apex predator doesn't chip your armor: it tears into the core.
+	if iframes > 0.0 or game_over or victory:
+		return
+	stats["apex_hits"] += 1
+	var n := (ppos - e.pos).normalized()
+	var k := mini(clampi(int(1.2 * e.r / R) + 1, 2, 6), surface_count())
+	_core_breach("%s STRIKE" % String(e.d["lbl"]))
+	if k > 0:
+		shed(k, (e.pos - ppos).angle())
+	iframes = 1.6
+	pvel = n * max_speed() * 4.0
+	# it mauls, then backs off: you get a window to break line of sight
+	e.calm = 4.0
+	e.state = 0
+	e.pounce = 0.0
+	e.pounce_cd = 5.0
+	e.wtarget = e.pos - n * e.r * 6.0
 
 
 func _resurface() -> void:
@@ -1820,6 +1860,10 @@ func _apex_ai(e: Thing, dt: float) -> void:
 	var edible := e.r < ABSORB_LIVE * R
 	var sight := e.r * 2.5 + R * 6.0
 	e.st -= dt
+	if e.calm > 0.0:
+		e.calm -= dt
+		e.vel = e.vel.lerp((e.wtarget - e.pos).normalized() * max_speed() * 0.5, 1.0 - exp(-3.0 * dt))
+		return
 	if edible:
 		# outgrown: now it's the one running
 		e.state = 0
@@ -1875,6 +1919,10 @@ func _enemy_shoot(e: Thing, atk: Dictionary, dir: Vector2) -> void:
 	b.col = Color(1.0, 0.35, 0.25)
 	b.hostile = true
 	b.power = float(atk.get("pow", 1.0)) * clampf(e.r / R, 0.15, 3.0) * (1.5 if e.elite else 1.0)
+	b.src = "apex_shot" if e.apex else "shot"
+	if e.apex:
+		b.col = Color(0.95, 0.1, 0.2)
+		b.r = maxf(R * 0.14, minf(e.r * 0.2, R * 0.4))
 	if atk.get("homing", false):
 		b.turn = 1.5
 	bullets.append(b)
@@ -1890,7 +1938,7 @@ func _update_bullets(dt: float) -> void:
 		b.pos += b.vel * dt
 		if b.hostile:
 			if not (game_over or victory) and b.pos.distance_to(ppos) < R + b.r:
-				player_hit(b.power, b.pos)
+				player_hit(b.power, b.pos, b.src)
 				b.life = -1.0
 		else:
 			for e: Thing in query(b.pos, b.r):
@@ -1916,7 +1964,9 @@ func _update_bullets(dt: float) -> void:
 	bullets = bullets.filter(func(b): return b.life > 0.0)
 
 
-func player_hit(power: float, src: Vector2) -> void:
+func player_hit(power: float, src: Vector2, who: String = "") -> void:
+	if apex_test and who != "":
+		print("HITLOG t=%.2f who=%s power=%.2f iframes=%.2f surface=%d" % [t, who, power, iframes, surface_count()])
 	if iframes > 0.0 or game_over or victory:
 		return
 	var n := power
@@ -2180,8 +2230,11 @@ func _player_collisions() -> void:
 		if e.contact_cd <= 0.0:
 			e.contact_cd = 1.0
 			if e.apex:
-				stats["apex_hits"] += 1
-			player_hit((2.0 if e.apex else 1.4) * e.r / R * (1.5 if e.elite else 1.0), e.pos)
+				if apex_test:
+					print("HITLOG t=%.2f who=apex_contact iframes=%.2f integ=%.1f" % [t, iframes, integrity])
+				_apex_strike(e)
+			else:
+				player_hit(1.4 * e.r / R * (1.5 if e.elite else 1.0), e.pos, "contact")
 			var spd_f := minf(pvel.length() / max_speed(), 3.0)
 			var crush := 1.5 * R * R * (0.5 + spd_f)
 			if has("wheel.base"):
@@ -2492,6 +2545,7 @@ func _update_camera(dt: float) -> void:
 	view_r = exp(lerpf(log(view_r), log(target), 1.0 - exp(-2.0 * dt)))
 	cam = cam.lerp(ppos + pvel * 0.25, 1.0 - exp(-6.0 * dt))
 	shake = maxf(0.0, shake - dt * 1.8)
+	hurt_vignette = maxf(0.0, hurt_vignette - dt)
 	shake_off = Vector2(rng.randf_range(-1, 1), rng.randf_range(-1, 1)) * shake * 10.0
 	_update_zoom()
 
@@ -2635,6 +2689,11 @@ func _draw() -> void:
 	_draw_enemies()
 	_draw_player()
 	_draw_fx()
+	if hurt_vignette > 0.0:
+		var a := hurt_vignette / 0.6
+		for k in 6:
+			var w := 18.0 + k * 14.0
+			draw_rect(Rect2(Vector2.ZERO, screen), Color(0.9, 0.05, 0.1, 0.09 * a), false, w)
 	_draw_hud()
 	if not pending.is_empty():
 		_draw_choice()
