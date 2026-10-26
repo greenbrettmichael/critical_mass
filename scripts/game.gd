@@ -119,6 +119,7 @@ var burst_t := 0.0
 var burst_cd := 0.0
 var dash_t := 0.0
 var syn_active := {}    # id -> {"cat": HullItem, "links": Array}
+var syn_seen := {}
 var com := Vector2.ZERO # hull-local center-of-mass offset
 var imbalance := 0.0
 var slam_cd := 0.0
@@ -192,6 +193,7 @@ var font: Font
 var polys := []
 var card_rects := []
 var choice_wait := 0
+var choice_hold := 20     # physics frames the autopilot lingers on a fork
 
 var prop_sorted: Array = []
 var enemy_sorted: Array = []
@@ -215,6 +217,7 @@ func _ready() -> void:
 			"quit_after": quit_after = float(v)
 			"start_r": start_r = float(v)
 			"start_t": t = float(v)
+			"choice_hold": choice_hold = int(v)
 	rng.seed = seed_v
 	if bot_mode:
 		bot = Bot.new()
@@ -248,7 +251,9 @@ func _ready() -> void:
 		spawn_prop_cluster(true)
 	for i in 10:
 		spawn_enemy()
-	_queue_start_choice()
+	syn_seen = syn_active.duplicate()
+	if start_r <= R0:
+		_queue_start_choice()
 
 
 func _seed_hull(target_r: float) -> void:
@@ -304,7 +309,9 @@ func _physics_process(dt: float) -> void:
 			choice_wait += 1
 			if choice_wait == 2 and shot_dir != "" and stats["picks"] < 6:
 				_take_shot("choice")
-			if choice_wait > 20:
+			if choice_wait == 1:
+				print("EVENT t=%.2f frame=%d CHOICE %s" % [t, frames, pending[0]["title"]])
+			if choice_wait > choice_hold:
 				choice_wait = 0
 				_choose(bot.pick(self, pending[0]["options"]))
 		return
@@ -1095,8 +1102,11 @@ func _recompute_synergies() -> void:
 	for id in syn_active:
 		if not prev.has(id):
 			var sd: Dictionary = syn_active[id]["def"]
-			banner("SYNERGY: " + String(sd["name"]).to_upper(), sd["desc"])
 			stats["synergies"] += 1
+			# announce a synergy once; it can flicker as pieces get buried and resurface
+			if not syn_seen.has(id):
+				syn_seen[id] = true
+				banner("SYNERGY: " + String(sd["name"]).to_upper(), sd["desc"])
 
 
 func _update_synergies(dt: float) -> void:
@@ -1499,6 +1509,7 @@ func _apex_ai(e: Thing, dt: float) -> void:
 			return
 	elif d - e.r < sight:
 		if e.state == 0:
+			print("EVENT t=%.2f frame=%d HUNT %s" % [t, frames, e.d["lbl"]])
 			text(e.pos + Vector2(0, -e.r * 1.3), "!", Color(1, 0.3, 0.2), 34)
 			ring(e.pos, e.r * 1.6, Color(1, 0.3, 0.2), 0.5)
 		e.state = 1
@@ -2105,6 +2116,7 @@ func banner(title: String, sub: String) -> void:
 	if banners.size() > 2:
 		banners.pop_front()
 	banners.append({"title": title, "sub": sub, "t": 3.5})
+	print("EVENT t=%.2f frame=%d BANNER %s" % [t, frames, title])
 
 
 func fmt_len(m: float) -> String:
