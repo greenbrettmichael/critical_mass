@@ -1898,6 +1898,8 @@ func _rival_can_eat(e: Thing, th: Thing) -> bool:
 		return false
 	if th.enemy:
 		return not th.apex and th.r < e.r * 0.45
+	if th.loose >= 0.0 and th.age < 0.8:
+		return false   # give the player a moment to grab their own shed pieces back
 	return th.r < e.r * 0.5
 
 
@@ -1964,7 +1966,7 @@ func _rival_feed(e: Thing, dt: float) -> void:
 
 func _boss_hurt(dmg: float) -> void:
 	var e := boss
-	var loss := dmg * 0.007
+	var loss := dmg * 0.004
 	e.hp -= loss
 	e.flash = 0.06
 	e.shed_acc += loss
