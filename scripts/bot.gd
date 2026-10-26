@@ -10,6 +10,11 @@ var stuck_t := 0.0
 var last_pos := Vector2.ZERO
 var escape_t := 0.0
 var t := 0.0
+var rng := RandomNumberGenerator.new()
+
+
+func pick(_g, options: Array) -> int:
+	return rng.randi() % options.size()
 
 
 func think(g, dt: float) -> Dictionary:
@@ -32,7 +37,7 @@ func think(g, dt: float) -> Dictionary:
 		seek = (target.pos - pos).normalized()
 	else:
 		if fmod(t, 3.0) < dt:
-			wander = Vector2.from_angle(randf() * TAU)
+			wander = Vector2.from_angle(rng.randf() * TAU)
 		seek = wander
 
 	var avoid := Vector2.ZERO
@@ -74,6 +79,17 @@ func think(g, dt: float) -> Dictionary:
 		if to.length() < s["r"] + R * 1.5:
 			avoid += to.normalized() * 4.0
 
+	# apex predators: stay well outside their sight unless we've outgrown them
+	for e in g.apexes:
+		if e.dead or e.r < g.ABSORB_LIVE * R:
+			continue
+		var to: Vector2 = pos - e.pos
+		var d: float = to.length()
+		var sight: float = e.r * 3.5 + R * 6.0
+		if d < sight * 1.3:
+			threats += 2
+			avoid += to / maxf(d, 0.0001) * 5.0 * (sight * 1.3 - d) / sight
+
 	var boss = g.boss
 	if boss != null and not boss.dead:
 		var to: Vector2 = boss.pos - pos
@@ -106,8 +122,8 @@ func think(g, dt: float) -> Dictionary:
 					var to: Vector2 = pos - p.pos
 					if to.length() < p.r + R * 3.0:
 						push += to.normalized()
-				wander = push.normalized() if push.length() > 0.1 else Vector2.from_angle(randf() * TAU)
-				wander = wander.rotated(randf_range(-0.6, 0.6))
+				wander = push.normalized() if push.length() > 0.1 else Vector2.from_angle(rng.randf() * TAU)
+				wander = wander.rotated(rng.randf_range(-0.6, 0.6))
 				target = null
 			stuck_t = 0.0
 			last_pos = pos
@@ -132,8 +148,6 @@ func _pick_target(g):
 		if d > 14.0:
 			continue
 		var v: float = pow(p.r / R, 2.0) * (3.0 if p.loose >= 0.0 else 1.0)
-		if p.d.get("w", {}).get("t", "none") != "none":
-			v *= 1.5
 		for tg in p.d.get("tags", []):
 			if tg in ["transformer", "cart", "knight", "mower", "crane", "sushi", "police"]:
 				v *= 2.0
