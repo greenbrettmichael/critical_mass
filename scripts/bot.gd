@@ -108,9 +108,9 @@ func think(g, dt: float) -> Dictionary:
 		if boss.r < R * 0.8:
 			seek = to.normalized() * 2.0
 		else:
-			# kite: orbit at a distance and let turrets/chunks do the work
+			# fight inside ability range, circling; back off when it winds up a lunge
 			var orbit: Vector2 = to.normalized().orthogonal()
-			var desired: float = R * 6.0 + boss.r
+			var desired: float = boss.r + (R * 6.0 if boss.state != 0 else R * 2.2)
 			var radial: Vector2 = -to.normalized() * clampf((desired - d) / (R * 2.0), -1.0, 1.5)
 			seek = seek * 0.6 + orbit * 0.7 + radial * 1.2
 		if d < R * 10.0 + boss.r:

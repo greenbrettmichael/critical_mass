@@ -68,6 +68,8 @@ class Thing:
 	var burn := 0.0
 	var pounce := 0.0       # apex pounce wind-up
 	var pounce_cd := 0.0
+	var dmg_by := {}        # apex/rival damage attribution, for tuning
+	var feelers := []       # the rival's feeding tentacles
 
 class HullItem:
 	var d: Dictionary
@@ -136,7 +138,7 @@ var com := Vector2.ZERO # hull-local center-of-mass offset
 var imbalance := 0.0
 var slam_cd := 0.0
 var collapse_idx := 0
-var stats := {"lurches": 0, "synergies": 0, "absorbed": 0, "kills": 0, "shed": 0, "recovered": 0, "lost": 0, "slams": 0,
+var stats := {"rival_ate": 0, "lurches": 0, "synergies": 0, "absorbed": 0, "kills": 0, "shed": 0, "recovered": 0, "lost": 0, "slams": 0,
 	"collapses": 0, "hits": 0, "core_hits": 0, "apex_kills": 0, "apex_hits": 0, "picks": 0}
 var regen_t := 0.0
 var game_over := false
@@ -205,7 +207,9 @@ var font: Font
 var polys := []
 var floor_col := Color(0.66, 0.47, 0.38)
 const OOZE := Color(0.045, 0.035, 0.06)
+const RIVAL_OOZE := Color(0.17, 0.02, 0.05)
 var card_rects := []
+var dmg_src := ""       # tag for whatever is dealing player damage right now
 var choice_wait := 0
 var bot_focus := ""
 var choice_hold := 20     # physics frames the autopilot lingers on a fork
@@ -548,6 +552,7 @@ func _update_abilities(dt: float) -> void:
 	var sp := pvel.length()
 
 	# INFERNO -----------------------------------------------------------------
+	dmg_src = "fire"
 	if has("fire.base") and float(cds.get("fire", 0.0)) <= 0.0:
 		cds["fire"] = 0.15
 		var reach := R * 2.6 * (1.6 if has("fire.long") else 1.0)
@@ -574,6 +579,7 @@ func _update_abilities(dt: float) -> void:
 				hurt(e, R * R * (0.45 if big else 0.25) * rank_mult("fire"))
 
 	# STORM --------------------------------------------------------------------
+	dmg_src = "electric"
 	if has("electric.base") and float(cds.get("arc", 0.0)) <= 0.0:
 		cds["arc"] = 0.9 * (0.55 if has("electric.rapid") else 1.0)
 		var srcs := [_focus("electric")]
@@ -625,10 +631,12 @@ func _update_abilities(dt: float) -> void:
 		shake = maxf(shake, 0.4)
 
 	# SWARM --------------------------------------------------------------------
+	dmg_src = "critter"
 	if has("organic.base"):
 		_update_critters(dt)
 
 	# MOMENTUM -----------------------------------------------------------------
+	dmg_src = "wheel"
 	if has("wheel.wake") and sp > max_speed() * 0.8 and float(cds.get("wake", 0.0)) <= 0.0:
 		cds["wake"] = 0.8
 		for e: Thing in query(ppos, R * 2.4):
@@ -639,6 +647,7 @@ func _update_abilities(dt: float) -> void:
 		patches.append({"pos": ppos - pvel.normalized() * R, "r": R * 0.7, "t": 2.0})
 
 	# SHRAPNEL -----------------------------------------------------------------
+	dmg_src = "blade"
 	if has("blade.base") and float(cds.get("spray", 0.0)) <= 0.0:
 		cds["spray"] = 1.1 * (0.6 if has("blade.quick") else 1.0)
 		if nearest_enemy_d < R * 7.0:
@@ -659,6 +668,7 @@ func _update_abilities(dt: float) -> void:
 					hurt(e, 0.5 * R * R * rank_mult("blade"))
 
 	# burning ground (napalm / comet trail)
+	dmg_src = "patch"
 	if not patches.is_empty() and float(cds.get("patch", 0.0)) <= 0.0:
 		cds["patch"] = 0.2
 		for pt in patches:
@@ -742,6 +752,7 @@ func _update_critters(dt: float) -> void:
 
 
 func _process_bursts() -> void:
+	dmg_src = "burst"
 	var todo := bursts.slice(0, 24)
 	bursts = bursts.slice(24)
 	for b in todo:
@@ -965,6 +976,7 @@ func _update_feelers(dt: float) -> void:
 
 
 func _slam(ang: float) -> void:
+	dmg_src = "slam"
 	slam_cd = 0.4 if has("wheel.thunder") else 0.8
 	stats["slams"] += 1
 	var c := ppos + Vector2.from_angle(ang) * R * 1.1
@@ -1174,6 +1186,7 @@ func _check_collapse() -> void:
 
 
 func do_collapse(silent: bool) -> void:
+	dmg_src = "collapse"
 	collapse_idx += 1
 	stats["collapses"] += 1
 	var crushed := 0
@@ -1285,6 +1298,7 @@ func _recompute_synergies() -> void:
 
 
 func _update_synergies(dt: float) -> void:
+	dmg_src = "synergy"
 	var sp := pvel.length()
 	if syn_active.has("blender"):
 		var n: int = 2 + syn_active["blender"]["links"].size()
@@ -1510,9 +1524,21 @@ func query(c: Vector2, q: float) -> Array:
 	return out
 
 
+func size_falloff(r: float) -> float:
+	# You can't do much to something much bigger than you: full damage up to
+	# your own size, 0.73x at 1.5x, 0.4x at 2x, 0.17x at 2.8x.
+	var rel := r / R
+	if rel <= 1.0:
+		return 1.0
+	return 1.0 / (1.0 + 1.5 * pow(rel - 1.0, 2.0))
+
+
 func hurt(e: Thing, dmg: float) -> void:
 	if e.dead:
 		return
+	dmg *= size_falloff(e.r)
+	if e.apex or e == boss:
+		e.dmg_by[dmg_src] = float(e.dmg_by.get(dmg_src, 0.0)) + dmg
 	if e == boss:
 		_boss_hurt(dmg)
 		return
@@ -1529,6 +1555,13 @@ func kill(e: Thing) -> void:
 	e.dead = true
 	stats["kills"] += 1
 	if e.apex:
+		var tot := 0.0
+		for k in e.dmg_by:
+			tot += float(e.dmg_by[k])
+		var parts := []
+		for k in e.dmg_by:
+			parts.append("%s %d%%" % [k, int(100.0 * float(e.dmg_by[k]) / maxf(tot, 0.0001))])
+		print("APEXDMG t=%.1f %s r/R=%.2f %s" % [t, e.d["lbl"], e.r / R, ", ".join(parts)])
 		_apex_reward(e, "DOWN")
 		for i in 8:
 			var th := Thing.new()
@@ -1737,6 +1770,7 @@ func _enemy_shoot(e: Thing, atk: Dictionary, dir: Vector2) -> void:
 
 
 func _update_bullets(dt: float) -> void:
+	dmg_src = "shard"
 	for b in bullets:
 		b.life -= dt
 		if b.turn > 0.0 and b.hostile:
@@ -1856,22 +1890,81 @@ func _boss_ai(e: Thing, dt: float) -> void:
 			if e.cd <= 0.0:
 				e.state = 0
 	e.pos += e.vel * dt
-	# the rival eats props too, and fights you for your shed pieces
-	for p in props:
-		if p.gone:
+	_rival_feed(e, dt)
+
+
+func _rival_can_eat(e: Thing, th: Thing) -> bool:
+	if th.gone or th.dead or th == e or th.carried or th.grabbed or th.fixed and th.r >= ABSORB * R:
+		return false
+	if th.enemy:
+		return not th.apex and th.r < e.r * 0.45
+	return th.r < e.r * 0.5
+
+
+func _rival_feed(e: Thing, dt: float) -> void:
+	# The rival is an ooze too: its tentacles drag in wildlife, props and your
+	# shed pieces, and every meal regrows it. Out-damage its eating.
+	var reach := e.r * 2.4
+	while e.feelers.size() < 6:
+		e.feelers.append({"target": null, "tip": e.pos, "latched": false})
+	var taken := {}
+	for f in e.feelers:
+		if f["target"] != null:
+			taken[f["target"]] = true
+	for f in e.feelers:
+		var tg = f["target"]
+		if tg != null and (not _rival_can_eat(e, tg) or tg.pos.distance_to(e.pos) > reach * 1.4 + tg.r):
+			taken.erase(tg)
+			f["target"] = null
+			f["latched"] = false
+			tg = null
+		if tg == null:
+			var best: Thing = null
+			var bd := INF
+			for list in [enemies, props]:
+				for th: Thing in list:
+					if taken.has(th) or not _rival_can_eat(e, th):
+						continue
+					var d := th.pos.distance_to(e.pos) - th.r
+					if d < reach and d < bd:
+						bd = d
+						best = th
+			if best != null:
+				f["target"] = best
+				taken[best] = true
+				tg = best
+		var tip: Vector2 = f["tip"]
+		if tg == null:
+			f["tip"] = tip.lerp(e.pos, 1.0 - exp(-10.0 * dt))
 			continue
-		var pd := p.pos.distance_to(e.pos)
-		if p.r < e.r * 0.5 and pd < e.r + p.r * 0.5:
-			if e.r < R * 2.2:
-				e.hp += p.r * p.r * GROWTH * 0.5
-			p.gone = true
-		elif p.loose >= 0.0 and pd < e.r * 3.5 and p.age > 0.6:
-			p.pos += (e.pos - p.pos).normalized() * R * 2.0 * dt
+		if not f["latched"]:
+			f["tip"] = tip.move_toward(tg.pos, e.r * 6.0 * dt)
+			if (f["tip"] as Vector2).distance_to(tg.pos) <= tg.r + e.r * 0.05:
+				f["latched"] = true
+			continue
+		var to: Vector2 = e.pos - tg.pos
+		var d := to.length()
+		tg.pos += to / maxf(d, 0.000001) * e.r * 2.0 * dt
+		if tg.enemy:
+			tg.vel *= 0.5
+		f["tip"] = tg.pos
+		if d < e.r + tg.r * 0.3:
+			# meals regenerate it back toward its arrival size, never beyond
+			var before := e.hp
+			e.hp = minf(e.max_hp, e.hp + tg.r * tg.r * (0.9 if tg.enemy else 0.5))
+			if e.hp > before + e.max_hp * 0.002:
+				fx_rings.append({"pos": e.pos, "r": e.r * 1.1, "col": Color(1.0, 0.3, 0.35, 0.5), "t": 0.25, "tm": 0.25})
+			if tg.enemy:
+				tg.dead = true
+			tg.gone = true
+			stats["rival_ate"] += 1
+			f["target"] = null
+			f["latched"] = false
 
 
 func _boss_hurt(dmg: float) -> void:
 	var e := boss
-	var loss := dmg * 0.003
+	var loss := dmg * 0.007
 	e.hp -= loss
 	e.flash = 0.06
 	e.shed_acc += loss
@@ -1924,6 +2017,7 @@ func _update_props(dt: float) -> void:
 
 
 func _player_collisions() -> void:
+	dmg_src = "contact"
 	var dt := get_physics_process_delta_time()
 	for p in props:
 		if p.gone or p.carried:
@@ -2184,7 +2278,7 @@ func _spawning(dt: float) -> void:
 	var p := clampf(t / run_len, 0.0, 1.0)
 	var target_n := int(36 + 70 * p)
 	if boss != null:
-		target_n = int(target_n * 0.35)
+		target_n = int(target_n * 0.8)
 	var alive := 0
 	for e in enemies:
 		if e.dead or e == boss or e.apex:
@@ -2221,6 +2315,7 @@ func vis_alpha(r: float) -> float:
 
 
 func _update_strikes(dt: float) -> void:
+	dmg_src = "strike"
 	if zone >= 4:
 		strike_cd -= dt
 		if strike_cd <= 0.0:
@@ -2576,15 +2671,36 @@ func _draw_enemies() -> void:
 
 
 func _draw_boss(e: Thing) -> void:
+	# a rival ooze: same body as yours, crimson-black, its own feeding arms
 	var c := w2s(e.pos)
 	var sr := e.r * zoom
-	draw_circle(c, sr * 1.6, Color(0.9, 0.2, 0.4, 0.08))
+	var tents := []
+	var i := 0
+	for f in e.feelers:
+		i += 1
+		if f["target"] == null and (f["tip"] as Vector2).distance_to(e.pos) < e.r * 1.05:
+			continue
+		tents.append({"tip": f["tip"], "w": 0.16, "latched": f["latched"], "seed": float(i) + 7.0})
+	for tt in tents:
+		_draw_tentacle(e.pos, e.r, tt["tip"], tt["w"], tt["latched"], tt["seed"], RIVAL_OOZE, Color(0.85, 0.25, 0.3, 0.9))
 	for part in e.parts:
 		var a: float = part["a"] + e.rot
 		var ps: float = part["s"] * sr
-		_shape(part["sh"], c + Vector2.from_angle(a) * (sr + ps * 0.2), ps, a, part["c"], Color(0, 0, 0, 0.6), 1.5)
-	draw_circle(c, sr, Color(1, 1, 1) if e.flash > 0.0 else Color(0.35, 0.05, 0.15))
-	draw_arc(c, sr, 0, TAU, 48, Color(1.0, 0.3, 0.5), 3.0)
+		_shape(part["sh"], c + Vector2.from_angle(a) * (sr + ps * 0.25), ps, a, part["c"], Color(0, 0, 0, 0.6), 1.5)
+	var body := _membrane(e.pos, e.r, e.vel, e.rot, tents, 1.0)
+	draw_colored_polygon(body, RIVAL_OOZE)
+	draw_circle(c, sr * 0.45, Color(0.9, 0.15, 0.25, 0.18))
+	draw_circle(c, sr * 0.22, Color(1.0, 0.35, 0.4, 0.3))
+	var shine := _membrane(e.pos, e.r, e.vel, e.rot, tents, 0.86)
+	var arc := PackedVector2Array()
+	for k in shine.size():
+		var th := TAU * k / shine.size()
+		if th > PI * 1.05 and th < PI * 1.55:
+			arc.append(shine[k])
+	if arc.size() > 1:
+		draw_polyline(arc, Color(1.0, 0.45, 0.5, 0.5), maxf(1.5, sr * 0.06))
+	body.append(body[0])
+	draw_polyline(body, Color(1, 1, 1, 0.9) if e.flash > 0.0 else Color(0.05, 0, 0.01, 0.9), maxf(1.5, sr * 0.035))
 	_label(c, "RIVAL", sr * 0.6, Color(1, 0.6, 0.7))
 
 
@@ -2602,14 +2718,14 @@ func _tentacles() -> Array:
 	return out
 
 
-func _draw_tentacle(tip: Vector2, w0: float, latched: bool, seed: float) -> void:
-	var to := tip - ppos
+func _draw_tentacle(origin: Vector2, rad: float, tip: Vector2, w0: float, latched: bool, seed: float, skin: Color, cell: Color) -> void:
+	var to := tip - origin
 	var L := to.length()
-	if L < R * 0.9:
+	if L < rad * 0.9:
 		return
 	var dir := to / L
 	var nrm := dir.orthogonal()
-	var base := ppos + dir * R * 0.75
+	var base := origin + dir * rad * 0.75
 	var span := tip - base
 	var bend := sin(t * 5.0 + seed * 1.7) * span.length() * 0.18
 	var ctrl := base + span * 0.5 + nrm * bend
@@ -2625,13 +2741,13 @@ func _draw_tentacle(tip: Vector2, w0: float, latched: bool, seed: float) -> void
 		var u := float(k) / n
 		var p: Vector2 = pts[k]
 		var tang: Vector2 = ((pts[mini(k + 1, n)] as Vector2) - (pts[maxi(k - 1, 0)] as Vector2)).normalized()
-		var w := R * w0 * lerpf(1.0, 0.28, u) * (1.0 + 0.12 * sin(u * 9.0 - t * 8.0))
+		var w := rad * w0 * lerpf(1.0, 0.28, u) * (1.0 + 0.12 * sin(u * 9.0 - t * 8.0))
 		left.append(w2s(p + tang.orthogonal() * w))
 		right.append(w2s(p - tang.orthogonal() * w))
 	right.reverse()
 	left.append_array(right)
-	draw_colored_polygon(left, OOZE)
-	draw_circle(w2s(tip), maxf(2.0, R * w0 * 0.55 * zoom), OOZE)
+	draw_colored_polygon(left, skin)
+	draw_circle(w2s(tip), maxf(2.0, rad * w0 * 0.55 * zoom), skin)
 	# cells stream out to forage, then back along a latched arm carrying food
 	for k in 3:
 		var u := fposmod(t * 1.4 + k / 3.0 + seed * 0.37, 1.0)
@@ -2639,24 +2755,26 @@ func _draw_tentacle(tip: Vector2, w0: float, latched: bool, seed: float) -> void
 			u = 1.0 - u
 		var idx := clampi(int(u * n), 0, n)
 		var cp: Vector2 = pts[idx]
-		draw_circle(w2s(cp), maxf(1.5, R * w0 * 0.35 * zoom), Color(0.32, 0.22, 0.42, 0.9))
+		draw_circle(w2s(cp), maxf(1.5, rad * w0 * 0.35 * zoom), cell)
 
 
-func _membrane(c: Vector2, sr: float, tents: Array, shrink: float) -> PackedVector2Array:
-	var sp := pvel.length()
+func _membrane(origin: Vector2, rad: float, vel: Vector2, ang: float, tents: Array, shrink: float) -> PackedVector2Array:
+	var c := w2s(origin)
+	var sr := rad * zoom
+	var sp := vel.length()
 	var st := clampf(sp / maxf(max_speed() * 5.0, 0.0001), 0.0, 0.32)
-	var va := pvel.angle()
+	var va := vel.angle()
 	var pts := PackedVector2Array()
 	var n := 64
 	for k in n:
 		var th := TAU * k / n
-		var ph := th - hull_ang
+		var ph := th - ang
 		var wob := 1.0 + 0.045 * sin(3.0 * ph + t * 1.7) + 0.03 * sin(5.0 * ph - t * 2.6) + 0.018 * sin(8.0 * ph + t * 4.1)
 		var phi := th - va
 		var ell := 1.0 / sqrt(pow(cos(phi) / (1.0 + st), 2.0) + pow(sin(phi) / (1.0 - 0.4 * st), 2.0))
 		var bulge := 0.0
 		for tt in tents:
-			var ta: float = ((tt["tip"] as Vector2) - ppos).angle()
+			var ta: float = ((tt["tip"] as Vector2) - origin).angle()
 			var dd := angle_difference(th, ta)
 			bulge += (0.5 * float(tt["w"])) * exp(-pow(dd / 0.32, 2.0))
 		pts.append(c + Vector2.from_angle(th) * sr * (wob * ell + bulge) * shrink)
@@ -2690,7 +2808,7 @@ func _draw_player() -> void:
 		draw_circle(cp, maxf(1.5, sr * 0.07), Color(0.55, 0.95, 0.45))
 	var tents := _tentacles()
 	for tt in tents:
-		_draw_tentacle(tt["tip"], tt["w"], tt["latched"], tt["seed"])
+		_draw_tentacle(ppos, R, tt["tip"], tt["w"], tt["latched"], tt["seed"], OOZE, Color(0.32, 0.22, 0.42, 0.9))
 	# hull pieces sit half-sunk in the ooze: draw them, then the membrane over their inner half
 	for it in items:
 		if not it.surface:
@@ -2706,7 +2824,7 @@ func _draw_player() -> void:
 				draw_line(p, p + Vector2.from_angle(la) * isr * 1.5, col.darkened(0.4), maxf(1.0, isr * 0.2))
 		var bc := _branch_col(it.d)
 		_shape(int(it.d.get("sh", 0)) if not it.creature else 0, p, isr, a, col, bc if bc.a > 0.0 else Color(0, 0, 0, 0.6), maxf(1.0, isr * (0.14 if bc.a > 0.0 else 0.08)))
-	var body := _membrane(c, sr, tents, 1.0)
+	var body := _membrane(ppos, R, pvel, hull_ang, tents, 1.0)
 	draw_colored_polygon(body, OOZE)
 	# what's inside: buried junk as faint silhouettes and the crushed core's glow
 	var bi := 0
@@ -2724,7 +2842,7 @@ func _draw_player() -> void:
 	draw_circle(c, sr * 0.42 * (0.6 + core_frac), Color(0.45, 0.18, 0.65, 0.14 + 0.2 * core_frac))
 	draw_circle(c, sr * 0.2 * (0.6 + core_frac), Color(0.75, 0.4, 1.0, 0.18 + 0.35 * core_frac))
 	# oily sheen: a thin iridescent highlight on the upper-left of the membrane
-	var shine := _membrane(c, sr, tents, 0.86)
+	var shine := _membrane(ppos, R, pvel, hull_ang, tents, 0.86)
 	var arc := PackedVector2Array()
 	var arc2 := PackedVector2Array()
 	for k in shine.size():
