@@ -217,6 +217,11 @@ var prop_by_name := {}
 
 func _ready() -> void:
 	font = ThemeDB.fallback_font
+	if "--write-movie" in OS.get_cmdline_args():
+		# render at a fixed 1280x720 regardless of how the window manager sizes the
+		# window, so recordings are never upscaled from a small tiled window
+		get_window().content_scale_mode = Window.CONTENT_SCALE_MODE_VIEWPORT
+		get_window().content_scale_size = Vector2i(1280, 720)
 	var seed_v := int(Time.get_unix_time_from_system())
 	var start_r := R0
 	for a in OS.get_cmdline_user_args():
