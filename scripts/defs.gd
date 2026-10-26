@@ -199,3 +199,26 @@ const TREE := [
 			[["orbit", "Halo Blades", "three blades orbit you"], ["ricochet", "Ricochet", "shards bounce to a new target"]],
 			[["circle", "Full Circle", "spray in all directions"], ["steel", "Storm of Steel", "twice the shards"]]]},
 ]
+
+# --- Terrain hazards ------------------------------------------------------------
+# Patches on the floor that slow, dry out, corrode, push or unbalance the ooze.
+# slow: crawl-speed multiplier. drain/corrode: seconds between pieces lost.
+# slick: traction multiplier. current: push speed (player radii/sec) along the patch.
+const TERRAIN := {
+	"salt": {"name": "SALT", "col": Color(0.95, 0.95, 0.92), "slow": 0.55, "drain": 1.4, "line": true, "desc": "drying out"},
+	"bleach": {"name": "BLEACH", "col": Color(0.75, 0.95, 0.95), "slow": 1.0, "corrode": 0.8, "desc": "corroding"},
+	"soda": {"name": "SODA SPILL", "col": Color(0.55, 0.3, 0.12), "slow": 0.35, "desc": "stuck"},
+	"cleaner": {"name": "CARPET CLEANER", "col": Color(0.6, 0.9, 0.75), "slow": 0.9, "corrode": 0.9, "desc": "corroding"},
+	"mud": {"name": "MUD", "col": Color(0.38, 0.27, 0.16), "slow": 0.45, "desc": "bogged down"},
+	"weedkiller": {"name": "WEED KILLER", "col": Color(0.75, 0.85, 0.3), "slow": 0.9, "corrode": 0.8, "desc": "corroding"},
+	"oil": {"name": "OIL SLICK", "col": Color(0.12, 0.12, 0.16), "slow": 1.0, "slick": 0.2, "desc": "sliding"},
+	"asphalt": {"name": "HOT ASPHALT", "col": Color(0.2, 0.17, 0.16), "slow": 0.75, "drain": 1.2, "desc": "drying out"},
+	"cement": {"name": "WET CEMENT", "col": Color(0.68, 0.68, 0.66), "slow": 0.3, "desc": "setting"},
+	"chemical": {"name": "CHEMICAL SPILL", "col": Color(0.5, 0.95, 0.35), "slow": 0.85, "corrode": 0.7, "desc": "corroding"},
+	"river": {"name": "RIVER", "col": Color(0.25, 0.45, 0.75), "slow": 0.8, "current": 2.6, "line": true, "desc": "swept along"},
+	"sand": {"name": "SAND", "col": Color(0.85, 0.75, 0.5), "slow": 0.55, "drain": 2.2, "desc": "drying out"},
+	"riptide": {"name": "RIPTIDE", "col": Color(0.3, 0.55, 0.8), "slow": 0.85, "current": 3.0, "line": true, "desc": "swept along"},
+	"lava": {"name": "LAVA", "col": Color(0.95, 0.35, 0.1), "slow": 0.7, "corrode": 0.5, "desc": "burning"},
+}
+const ZONE_TERRAIN := [["salt", "bleach"], ["soda", "cleaner"], ["mud", "weedkiller"], ["oil", "asphalt"],
+	["cement", "chemical"], ["river", "chemical"], ["sand", "riptide"], ["lava", "riptide"]]

@@ -85,6 +85,19 @@ func think(g, dt: float) -> Dictionary:
 		var gap: float = (d - p.r * 0.85 - R) / R
 		if gap < 1.5:
 			avoid += to / maxf(d, 0.0001) * 0.6 / maxf(gap + 0.3, 0.15)
+	# floor hazards: steer around anything that strips pieces, mildly around slow ground
+	for h in g.terrain:
+		var td: Dictionary = Defs.TERRAIN[h["type"]]
+		var k: float = g.terrain_strength(h["r"])
+		if k <= 0.0:
+			continue
+		var to: Vector2 = pos - h["pos"]
+		var d: float = to.length()
+		var gap: float = (d - float(h["r"]) - R) / R
+		if gap > 2.0:
+			continue
+		var harm: float = 1.6 if (td.has("drain") or td.has("corrode")) else (0.5 if float(td.get("slow", 1.0)) < 0.6 else 0.15)
+		avoid += to / maxf(d, 0.0001) * harm * k / maxf(gap + 0.6, 0.25)
 	for s in g.strikes:
 		var to: Vector2 = pos - s["pos"]
 		if to.length() < s["r"] + R * 1.5:

@@ -138,7 +138,7 @@ var com := Vector2.ZERO # hull-local center-of-mass offset
 var imbalance := 0.0
 var slam_cd := 0.0
 var collapse_idx := 0
-var stats := {"rival_ate": 0, "lurches": 0, "synergies": 0, "absorbed": 0, "kills": 0, "shed": 0, "recovered": 0, "lost": 0, "slams": 0,
+var stats := {"terrain_hits": 0, "terrain_time": 0.0, "rival_ate": 0, "lurches": 0, "synergies": 0, "absorbed": 0, "kills": 0, "shed": 0, "recovered": 0, "lost": 0, "slams": 0,
 	"collapses": 0, "hits": 0, "core_hits": 0, "apex_kills": 0, "apex_hits": 0, "picks": 0}
 var regen_t := 0.0
 var game_over := false
@@ -170,6 +170,9 @@ var arena_r := INF
 var wall_r := 0.0
 var zone_open := false
 var apexes: Array[Thing] = []
+var terrain := []        # floor hazards: {"type", "pos", "r", "dir", "seed"}
+var terrain_on := {}     # type -> strength (0..1) of what you're standing in this frame
+var terrain_tick := {}   # type -> countdown to the next piece lost
 
 # --- world ---
 var props: Array[Thing] = []
@@ -779,13 +782,15 @@ func _update_player(dt: float) -> void:
 	slam_cd -= dt
 	dash_t -= dt
 	var accel := 7.0 * R * (1.0 - 0.6 * imbalance) * (1.6 if has("wheel.traction") else 1.0)
-	var target := input_move.limit_length(1.0) * max_speed()
+	var tf := _terrain_effects(dt)
+	var target := input_move.limit_length(1.0) * max_speed() * float(tf["slow"])
+	accel *= float(tf["slick"])
 	_update_lurch(dt)
 	if dash_t <= 0.0 and lurch_state != 2:
 		# an ooze crawl: sluggish to get going, and it bleeds off lurch momentum fast
-		var over := pvel.length() > max_speed() * 1.05
-		pvel = pvel.move_toward(target, (11.0 * R if over else accel) * dt)
-	ppos += pvel * dt
+		var over := pvel.length() > max_speed() * float(tf["slow"]) * 1.05
+		pvel = pvel.move_toward(target, (11.0 * R * float(tf["slick"]) if over else accel) * dt)
+	ppos += (pvel + (tf["push"] as Vector2)) * dt
 	_update_feelers(dt)
 
 	# Spin model: steering curls the hull, the heavy side swings to trail like a
@@ -1421,8 +1426,114 @@ func _setup_zone(i: int) -> void:
 	for k in 2:
 		var at := Vector2.from_angle(rng.randf() * TAU) * rng.randf_range(0.4, 0.85) * arena_r
 		_spawn_theme(at, sqrt(lo * hi) * 1.3, true)
+	_place_terrain(i)
 	_spawn_apex()
 	banner(String(zone_def["name"]), "the %ss give way at %s across" % [String(zone_def["wall"]["name"]).to_lower(), fmt_len(wall_r / ABSORB * 2.0)])
+
+
+func _place_terrain(i: int) -> void:
+	# Floor hazards for this zone: blobby spills plus a few lines (salt lines,
+	# rivers, riptides) that cut across the arena and have to be lurched over.
+	var types: Array = Defs.ZONE_TERRAIN[mini(i, Defs.ZONE_TERRAIN.size() - 1)]
+	var lo := float(zone_def["lo"])
+	var hi := float(zone_def["hi"]) if float(zone_def["hi"]) > 0.0 else lo * 4.0
+	var span := arena_r if arena_r < INF else hi * 14.0
+	var safe := ppos
+	var placed := 0
+	var guard := 0
+	while placed < 34 and guard < 600:
+		guard += 1
+		var tp: String = types[placed % types.size()]
+		var td: Dictionary = Defs.TERRAIN[tp]
+		var at := Vector2.from_angle(rng.randf() * TAU) * sqrt(rng.randf()) * span * 0.85
+		var s := exp(rng.randf_range(log(1.5 * lo), log(0.7 * hi)))
+		if at.distance_to(safe) < s + 8.0 * lo + R * 4.0:
+			continue
+		_add_terrain(tp, at, s, false, safe, 6.0 * lo + R * 3.0)
+		placed += 1
+
+
+func _add_terrain(tp: String, at: Vector2, s: float, dynamic: bool, safe: Vector2, safe_r: float) -> void:
+	var td: Dictionary = Defs.TERRAIN[tp]
+	var seed := rng.randf() * 100.0
+	if td.get("line", false):
+		# a line of overlapping blobs; currents flow along it
+		var dir := Vector2.from_angle(rng.randf() * TAU)
+		var n := rng.randi_range(8, 16)
+		var w := s * 0.55
+		for k in n:
+			var p := at + dir * (k - n * 0.5) * w * 1.3 + dir.orthogonal() * sin(k * 0.6 + seed) * w * 0.8
+			if p.distance_to(safe) < w + safe_r:
+				continue
+			terrain.append({"type": tp, "pos": p, "r": w * rng.randf_range(0.85, 1.15), "dir": dir, "seed": seed + k, "dyn": dynamic})
+	else:
+		for k in rng.randi_range(2, 5):
+			var p := at + Vector2.from_angle(rng.randf() * TAU) * s * rng.randf_range(0.0, 0.8)
+			terrain.append({"type": tp, "pos": p, "r": s * rng.randf_range(0.5, 0.9), "dir": Vector2.ZERO, "seed": seed + k, "dyn": dynamic})
+	# harmful spills are baited: something worth eating sits in the middle
+	if td.has("drain") or td.has("corrode"):
+		_bait_cluster(at, s)
+
+
+func _bait_cluster(at: Vector2, s: float) -> void:
+	var base_s := clampf(s * 0.25, R * 0.2, R * 0.48)
+	if base_s < SEE_MIN * R * 1.2:
+		return
+	for k in rng.randi_range(2, 5):
+		var th := Thing.new()
+		var sz := base_s * rng.randf_range(0.7, 1.2)
+		th.d = _pick_def(prop_sorted, sz)
+		th.r = sz
+		th.pos = at + Vector2.from_angle(rng.randf() * TAU) * s * rng.randf_range(0.0, 0.5)
+		th.rot = rng.randf() * TAU
+		th.age = 10.0
+		props.append(th)
+
+
+func terrain_strength(r: float) -> float:
+	# a puddle stops mattering once you're much bigger than it
+	return clampf((r / R - SEE_MIN) / 0.5, 0.0, 1.0)
+
+
+func _terrain_effects(dt: float) -> Dictionary:
+	var slow := 1.0
+	var slick := 1.0
+	var push := Vector2.ZERO
+	terrain_on.clear()
+	for h in terrain:
+		var hr: float = h["r"]
+		if (h["pos"] as Vector2).distance_to(ppos) > hr + R * 0.5:
+			continue
+		var k := terrain_strength(hr)
+		if k <= 0.0:
+			continue
+		var td: Dictionary = Defs.TERRAIN[h["type"]]
+		terrain_on[h["type"]] = maxf(float(terrain_on.get(h["type"], 0.0)), k)
+		slow = minf(slow, lerpf(1.0, float(td.get("slow", 1.0)), k))
+		slick = minf(slick, lerpf(1.0, float(td.get("slick", 1.0)), k))
+		if td.has("current"):
+			push += (h["dir"] as Vector2) * float(td["current"]) * R * k / 3.0
+	push = push.limit_length(R * 3.0)
+	if not terrain_on.is_empty():
+		stats["terrain_time"] = float(stats["terrain_time"]) + dt
+	# drying out and corrosion: lose a piece every so often while you sit in it
+	for tp in terrain_on:
+		var td: Dictionary = Defs.TERRAIN[tp]
+		var every := float(td.get("drain", td.get("corrode", 0.0)))
+		if every <= 0.0:
+			continue
+		terrain_tick[tp] = float(terrain_tick.get(tp, every * 0.5)) - dt * float(terrain_on[tp])
+		if float(terrain_tick[tp]) <= 0.0:
+			terrain_tick[tp] = every
+			stats["terrain_hits"] += 1
+			var power := 1.4 if td.has("corrode") else 1.0
+			var src := ppos + Vector2.from_angle(rng.randf() * TAU) * R
+			player_hit(power, src)
+			text(ppos + Vector2(0, R * 1.4), String(td["desc"]).to_upper(), td["col"].lightened(0.3), 13)
+	for tp in terrain_tick.keys():
+		if not terrain_on.has(tp):
+			terrain_tick.erase(tp)
+	return {"slow": slow, "slick": slick, "push": push}
 
 
 func _overlaps_fixed(at: Vector2, s: float, pad: float) -> bool:
@@ -2276,6 +2387,26 @@ func _spawning(dt: float) -> void:
 		spawn_prop_cluster(false)
 		near += 5
 
+	# floor hazards at the player's own scale, so they stay relevant as you grow
+	var near_t := 0
+	var keep_t := []
+	for h in terrain:
+		var d := (h["pos"] as Vector2).distance_to(ppos)
+		if h.get("dyn", false) and d > hd * 3.2:
+			continue
+		if terrain_strength(h["r"]) <= 0.0 and d > hd * 1.5:
+			continue
+		keep_t.append(h)
+		if d < hd * 2.6 and terrain_strength(h["r"]) > 0.3:
+			near_t += 1
+	terrain = keep_t
+	if near_t < 26:
+		var types: Array = Defs.ZONE_TERRAIN[mini(zone, Defs.ZONE_TERRAIN.size() - 1)]
+		var sz := R * exp(rng.randf_range(log(0.8), log(3.0)))
+		var at := _arena_spawn_point(sz)
+		if at != Vector2.INF:
+			_add_terrain(types[rng.randi() % types.size()], at, sz, true, ppos, R * 3.0)
+
 	# local wildlife density around the player
 	var p := clampf(t / run_len, 0.0, 1.0)
 	var target_n := int(36 + 70 * p)
@@ -2497,6 +2628,7 @@ func _branch_col(d: Dictionary) -> Color:
 
 func _draw() -> void:
 	_draw_grid()
+	_draw_terrain()
 	_draw_patches()
 	_draw_props()
 	_draw_strikes()
@@ -2544,6 +2676,46 @@ func _draw_grid() -> void:
 	draw_line(o + Vector2(0, -5), o + Vector2(0, 5), Color(1, 1, 1, 0.6), 2.0)
 	draw_line(o + Vector2(px, -5), o + Vector2(px, 5), Color(1, 1, 1, 0.6), 2.0)
 	draw_string(font, o + Vector2(px * 0.5 - 20, -8), fmt_len(bar_m), HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color(1, 1, 1, 0.7))
+
+
+func _draw_terrain() -> void:
+	for h in terrain:
+		var hr: float = h["r"]
+		if not _on_screen(h["pos"], hr * 1.2):
+			continue
+		var k := terrain_strength(hr)
+		if k <= 0.0:
+			continue
+		var td: Dictionary = Defs.TERRAIN[h["type"]]
+		var col: Color = td["col"]
+		var c := w2s(h["pos"])
+		var sr := hr * zoom
+		var sd: float = h["seed"]
+		var pts := PackedVector2Array()
+		for j in 20:
+			var a := TAU * j / 20.0
+			var wob := 1.0 + 0.12 * sin(3.0 * a + sd) + 0.07 * sin(7.0 * a + sd * 2.3)
+			pts.append(c + Vector2.from_angle(a) * sr * wob)
+		draw_colored_polygon(pts, Color(col, 0.55 * k + 0.15))
+		if td.has("current") and sr > 8.0:
+			# flow streaks drifting along the current
+			var dir: Vector2 = h["dir"]
+			for j in 3:
+				var off := fposmod(t * 0.6 + j / 3.0 + sd * 0.1, 1.0) * 2.0 - 1.0
+				var p := c + dir * off * sr * 0.7 + dir.orthogonal() * (j - 1) * sr * 0.35
+				draw_line(p - dir * sr * 0.18, p + dir * sr * 0.18, Color(1, 1, 1, 0.35 * k), maxf(1.5, sr * 0.04))
+		elif td.has("corrode") and sr > 8.0:
+			for j in 3:
+				var bp := c + Vector2.from_angle(sd + j * 2.1) * sr * 0.4 * fposmod(t * 0.3 + j * 0.37, 1.0)
+				draw_arc(bp, sr * 0.08, 0, TAU, 10, Color(1, 1, 1, 0.4 * k), 1.5)
+		elif h["type"] in ["salt", "sand"] and sr > 8.0:
+			for j in 6:
+				draw_circle(c + Vector2.from_angle(sd * 3.0 + j * 1.3) * sr * (0.2 + 0.12 * j), maxf(1.0, sr * 0.03), Color(col.darkened(0.3), 0.6 * k))
+		if sr > 40.0 and int(sd) % 3 == 0:
+			var nm: String = td["name"]
+			var fs := clampi(int(sr * 0.18), 10, 16)
+			var w := font.get_string_size(nm, HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
+			draw_string(font, c + Vector2(-w * 0.5, fs * 0.35), nm, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color(col.darkened(0.55), 0.7 * k))
 
 
 func _draw_patches() -> void:
@@ -2957,6 +3129,11 @@ func _draw_hud() -> void:
 		draw_rect(Rect2(16, 142, 200 * f, 8), Color(0.8, 0.5, 1.0))
 		_hud_text(Vector2(222, 151), "collapse @ " + fmt_len(nxt * 2.0), 12, Color(0.8, 0.7, 1.0))
 	_hud_text(Vector2(16, 172), "lopsided %d%%" % int(imbalance / 0.6 * 100.0), 12, Color(1.0, 0.85, 0.4) if imbalance > 0.06 else Color(0.6, 0.6, 0.65))
+	var ty := 192.0
+	for tp in terrain_on:
+		var td: Dictionary = Defs.TERRAIN[tp]
+		_hud_text(Vector2(16, ty), "IN %s — %s" % [td["name"], td["desc"]], 13, (td["col"] as Color).lightened(0.35))
+		ty += 18.0
 	var bc := "CHURN ready" if burst_cd <= 0.0 else "churn %.0fs" % burst_cd
 	_hud_text(Vector2(120, 172), bc, 12, Color(0.85, 0.7, 1.0) if burst_cd <= 0.0 else Color(0.5, 0.5, 0.55))
 	_draw_tree_panel()
