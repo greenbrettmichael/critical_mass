@@ -768,7 +768,7 @@ func _update_player(dt: float) -> void:
 	if dash_t <= 0.0 and lurch_state != 2:
 		# an ooze crawl: sluggish to get going, and it bleeds off lurch momentum fast
 		var over := pvel.length() > max_speed() * 1.05
-		pvel = pvel.move_toward(target, (16.0 * R if over else accel) * dt)
+		pvel = pvel.move_toward(target, (11.0 * R if over else accel) * dt)
 	ppos += pvel * dt
 	_update_feelers(dt)
 
@@ -2489,7 +2489,7 @@ func _draw_props() -> void:
 			draw_line(c + Vector2(-sr, -sr) * 0.5, c + Vector2(sr, sr) * 0.5, Color(0, 0, 0, 0.6), maxf(1.0, sr * 0.12))
 			draw_line(c + Vector2(-sr, sr) * 0.5, c + Vector2(sr, -sr) * 0.5, Color(0, 0, 0, 0.6), maxf(1.0, sr * 0.12))
 		elif not p.wall or (sr > 30.0 and p.get_instance_id() % 14 == 0):
-			_label(c, String(p.d["lbl"]), sr, Color(0, 0, 0, 0.75) if fill.get_luminance() > 0.45 else Color(1, 1, 1, 0.8))
+			_label(c, String(p.d["lbl"]), sr, Color(0, 0, 0, 0.75 * va) if fill.get_luminance() > 0.45 else Color(1, 1, 1, 0.8 * va))
 		# essence hint: a dot in the colour of the branch this thing feeds
 		var bc := _branch_col(p.d)
 		if bc.a > 0.0 and sr > 5.0 and edible and not p.wreck:
