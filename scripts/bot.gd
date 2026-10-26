@@ -130,7 +130,7 @@ func think(g, dt: float) -> Dictionary:
 			avoid += -to.normalized() * 0.8
 	# the goal: once the planet core is edible, go eat it
 	var core = g.core
-	if core != null and not core.gone and core.r < g.ABSORB * R:
+	if core != null and not core.gone and R >= g.TARGET_R:
 		seek = (core.pos - pos).normalized() * 2.5
 
 	var mv := seek + avoid

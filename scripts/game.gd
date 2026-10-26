@@ -865,6 +865,8 @@ func lurch_cooldown() -> float:
 
 
 func _lurchable(th: Thing) -> bool:
+	if th == core:
+		return not th.gone and R >= TARGET_R
 	if th.gone or th.dead or th.carried or th.grabbed or vis_alpha(th.r) <= 0.0:
 		return false
 	if th.enemy:
@@ -968,7 +970,7 @@ func _update_feelers(dt: float) -> void:
 			var bd := INF
 			for list in [props, enemies]:
 				for th: Thing in list:
-					if th.gone or th.dead or th.carried or taken.has(th) or th == lurch_target or th.age < 0.0:
+					if th.gone or th.dead or th.carried or taken.has(th) or th == lurch_target or th.age < 0.0 or th == core:
 						continue
 					if th.loose >= 0.0 and not has("metal.riveted"):
 						continue
@@ -2036,11 +2038,17 @@ func _check_rival(dt: float) -> void:
 
 
 func _spawn_core() -> void:
-	var d := {"name": "Planet Core", "lbl": "PLANET CORE", "col": Color(1.0, 0.55, 0.15), "sh": 0, "tags": ["fire", "metal"], "r": TARGET_R * ABSORB * 0.95, "den": 20.0}
+	# the one thing you can eat at your own size: it's as big as the target you
+	# have to reach, and swallowing it is the whole point
+	var d := {"name": "Planet Core", "lbl": "PLANET CORE", "col": Color(1.0, 0.55, 0.15), "sh": 0, "tags": ["fire", "metal"], "r": TARGET_R * 0.95, "den": 20.0}
 	var th := Thing.new()
 	th.d = d
 	th.r = float(d["r"])
 	th.pos = Vector2.ZERO
+	# it lives at the centre of the world you spiralled out of; if you're already
+	# standing on it (debug starts begin at the centre), it surfaces further out
+	if ppos.length() < th.r * 6.0:
+		th.pos = ppos + Vector2.from_angle(rng.randf() * TAU) * th.r * 6.0
 	th.fixed = true
 	th.age = 10.0
 	props.append(th)
@@ -2109,7 +2117,7 @@ func _boss_ai(e: Thing, dt: float) -> void:
 	for a in apexes:
 		if not a.dead and a.r > e.r * 0.42 and a.pos.distance_to(e.pos) < a.r * 3.5 + e.r * 6.0:
 			flee += (e.pos - a.pos).normalized()
-	if core != null and not core.gone and core.r < e.r * 0.5:
+	if core != null and not core.gone and e.r >= TARGET_R:
 		want = (core.pos - e.pos).normalized() * spd * 1.2
 	elif flee != Vector2.ZERO:
 		want = flee.normalized() * spd
@@ -2159,7 +2167,7 @@ func _boss_ai(e: Thing, dt: float) -> void:
 				e.vel = tdir * spd * 2.6
 		else:
 			want = dir * spd * 0.5
-	if d > hd * 1.6 and not (core != null and not core.gone and core.r < e.r * 0.5):
+	if d > hd * 1.6 and not (core != null and not core.gone and e.r >= TARGET_R):
 		want = dir * spd
 	e.cd -= dt
 	if e.st <= 0.0:
@@ -2170,7 +2178,7 @@ func _boss_ai(e: Thing, dt: float) -> void:
 
 func _rival_can_eat(e: Thing, th: Thing) -> bool:
 	if th == core:
-		return not th.gone and th.r < e.r * 0.5
+		return not th.gone and e.r >= TARGET_R
 	if th.gone or th.dead or th == e or th.carried or th.grabbed or th.fixed and th.r >= ABSORB * R:
 		return false
 	if th.enemy:
@@ -2308,6 +2316,8 @@ func _player_collisions() -> void:
 		if d > R * 6.0 + p.r:
 			continue
 		var edible := p.r < ABSORB * R or (p.loose >= 0.0 and p.r < LOOSE_ABSORB * R)
+		if p == core:
+			edible = R >= TARGET_R
 		if edible:
 			if d < R + p.r * 0.5 and not (p.loose >= 0.0 and p.age < 0.35):
 				absorb(p)
@@ -2917,6 +2927,8 @@ func _draw_props() -> void:
 		var fill: Color = p.d["col"]
 		var sh: int = int(p.d.get("sh", 0))
 		var edible := p.r < ABSORB * R or (p.loose >= 0.0 and p.r < LOOSE_ABSORB * R)
+		if p == core:
+			edible = R >= TARGET_R
 		if p.wreck:
 			fill = fill.darkened(0.45)
 			fill.a = 0.75 * clampf((9.0 - p.age) / 2.0, 0.0, 1.0)
@@ -3418,7 +3430,7 @@ func _draw_apex_markers() -> void:
 		if e == boss:
 			col = Color(0.55, 1.0, 0.65) if e.r < R * 0.8 else Color(1.0, 0.45, 0.55)
 		elif e == core:
-			col = Color(1.0, 0.65, 0.25) if e.r >= ABSORB * R else Color(0.55, 1.0, 0.65)
+			col = Color(0.55, 1.0, 0.65) if R >= TARGET_R else Color(1.0, 0.65, 0.25)
 		var side := dir.orthogonal() * 9.0
 		draw_colored_polygon(PackedVector2Array([p + dir * 14.0, p - dir * 4.0 + side, p - dir * 4.0 - side]), col)
 		var lbl := "%s %s" % [String(e.d["lbl"]), fmt_len(e.pos.distance_to(ppos))]
