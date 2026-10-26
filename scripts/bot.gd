@@ -11,10 +11,21 @@ var last_pos := Vector2.ZERO
 var escape_t := 0.0
 var t := 0.0
 var rng := RandomNumberGenerator.new()
+var focus := ""   # optional branch tag the autopilot tries to build around
 
 
 func pick(_g, options: Array) -> int:
+	if focus != "":
+		for i in options.size():
+			if options[i]["tag"] == focus:
+				return i
 	return rng.randi() % options.size()
+
+
+func _diet_weight(d: Dictionary) -> float:
+	if focus == "":
+		return 1.0
+	return 4.0 if d.get("tags", []).has(focus) else 0.5
 
 
 func think(g, dt: float) -> Dictionary:
@@ -22,7 +33,7 @@ func think(g, dt: float) -> Dictionary:
 	retarget -= dt
 	var R: float = g.R
 	var pos: Vector2 = g.ppos
-	var out := {"move": Vector2.ZERO, "burst": false, "spin": 0.0}
+	var out := {"move": Vector2.ZERO, "burst": false, "spin": 0.0, "lurch": false}
 	if g.game_over or g.victory:
 		return out
 
@@ -130,6 +141,13 @@ func think(g, dt: float) -> Dictionary:
 	out["move"] = mv.normalized()
 	if threats >= 4:
 		out["burst"] = true
+	# lurch at the current target once it's within reach, or lurch to flee a hunting apex
+	if g.lurch_state == 0 and g.lurch_cd <= 0.0:
+		if target != null and not target.gone and pos.distance_to(target.pos) - target.r - R < g.lurch_range() and avoid.length() < 1.5:
+			out["lurch"] = true
+		for e in g.apexes:
+			if not e.dead and e.state == 1 and pos.distance_to(e.pos) - e.r < R * 8.0:
+				out["lurch"] = true
 	return out
 
 
@@ -147,7 +165,7 @@ func _pick_target(g):
 		var d := pos.distance_to(p.pos) / R
 		if d > 14.0:
 			continue
-		var v: float = pow(p.r / R, 2.0) * (3.0 if p.loose >= 0.0 else 1.0)
+		var v: float = pow(p.r / R, 2.0) * (3.0 if p.loose >= 0.0 else 1.0) * _diet_weight(p.d)
 		for tg in p.d.get("tags", []):
 			if tg in ["transformer", "cart", "knight", "mower", "crane", "sushi", "police"]:
 				v *= 2.0
@@ -162,7 +180,7 @@ func _pick_target(g):
 		var d := pos.distance_to(e.pos) / R
 		if d > 10.0:
 			continue
-		var s := pow(e.r / R, 2.0) / pow(d + 2.0, 1.6)
+		var s := pow(e.r / R, 2.0) * _diet_weight(e.d) / pow(d + 2.0, 1.6)
 		if s > bs:
 			bs = s
 			best = e

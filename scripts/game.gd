@@ -13,7 +13,8 @@ const ABSORB := 0.5         # props / wrecks absorbable when r < ABSORB * R
 const ABSORB_LIVE := 0.42   # live enemies absorbable when r < ABSORB_LIVE * R
 const LOOSE_ABSORB := 0.75  # shed pieces can be re-grabbed up to this ratio
 const BURY := 0.05          # surface items get buried once r < BURY * R
-const DUST := 0.03          # world things below DUST * R dissolve into dust
+const SEE_MIN := 0.12       # things below SEE_MIN * R are beneath notice: they fade out
+                            # and can't be eaten, so outgrown material stops feeding the tree
 const VIEW_K := 7.0         # half screen height, in player radii
 const R0 := 0.05            # 10 cm diameter start
 const GROWTH := 0.16
@@ -65,6 +66,8 @@ class Thing:
 	var leash := 1.0
 	var stun := 0.0
 	var burn := 0.0
+	var pounce := 0.0       # apex pounce wind-up
+	var pounce_cd := 0.0
 
 class HullItem:
 	var d: Dictionary
@@ -118,13 +121,22 @@ var iframes := 0.0
 var burst_t := 0.0
 var burst_cd := 0.0
 var dash_t := 0.0
+# slime-mold movement: a pseudopod reaches for a target, latches, and the body lurches after it
+var lurch_state := 0     # 0 idle, 1 reaching, 2 pulling
+var lurch_t := 0.0
+var lurch_cd := 0.0
+var lurch_target: Thing = null
+var lurch_tip := Vector2.ZERO
+var want_lurch := false
+var click_world := Vector2.INF
+var feelers := []        # passive feeding tentacles: {"target", "tip", "latched"}
 var syn_active := {}    # id -> {"cat": HullItem, "links": Array}
 var syn_seen := {}
 var com := Vector2.ZERO # hull-local center-of-mass offset
 var imbalance := 0.0
 var slam_cd := 0.0
 var collapse_idx := 0
-var stats := {"synergies": 0, "absorbed": 0, "kills": 0, "shed": 0, "recovered": 0, "lost": 0, "slams": 0,
+var stats := {"lurches": 0, "synergies": 0, "absorbed": 0, "kills": 0, "shed": 0, "recovered": 0, "lost": 0, "slams": 0,
 	"collapses": 0, "hits": 0, "core_hits": 0, "apex_kills": 0, "apex_hits": 0, "picks": 0}
 var regen_t := 0.0
 var game_over := false
@@ -191,8 +203,11 @@ var zoom := 1.0
 var screen := Vector2(1280, 720)
 var font: Font
 var polys := []
+var floor_col := Color(0.66, 0.47, 0.38)
+const OOZE := Color(0.045, 0.035, 0.06)
 var card_rects := []
 var choice_wait := 0
+var bot_focus := ""
 var choice_hold := 20     # physics frames the autopilot lingers on a fork
 
 var prop_sorted: Array = []
@@ -218,10 +233,12 @@ func _ready() -> void:
 			"start_r": start_r = float(v)
 			"start_t": t = float(v)
 			"choice_hold": choice_hold = int(v)
+			"bot_focus": bot_focus = v
 	rng.seed = seed_v
 	if bot_mode:
 		bot = Bot.new()
 		bot.rng.seed = seed_v
+		bot.focus = bot_focus
 	if shot_dir != "":
 		DirAccess.make_dir_recursive_absolute(shot_dir)
 		next_shot = t + 1.0
@@ -323,6 +340,7 @@ func _physics_process(dt: float) -> void:
 		input_move = b["move"]
 		want_burst = b["burst"]
 		manual_spin = b["spin"]
+		want_lurch = b.get("lurch", false)
 
 	_build_grid()
 	if not (game_over or victory):
@@ -342,6 +360,7 @@ func _physics_process(dt: float) -> void:
 		_check_boss()
 	_cleanup()
 	_update_camera(dt)
+	_update_floor(dt)
 	_update_fx(dt)
 	_telemetry()
 
@@ -384,7 +403,8 @@ func _read_input() -> void:
 	manual_spin = 0.0
 	if Input.is_key_pressed(KEY_Q): manual_spin -= 1
 	if Input.is_key_pressed(KEY_E): manual_spin += 1
-	want_burst = Input.is_key_pressed(KEY_SPACE)
+	want_lurch = Input.is_key_pressed(KEY_SPACE)
+	want_burst = Input.is_key_pressed(KEY_SHIFT)
 
 
 func _unhandled_input(ev: InputEvent) -> void:
@@ -398,6 +418,8 @@ func _unhandled_input(ev: InputEvent) -> void:
 				if card_rects[i].has_point(ev.position):
 					_choose(i)
 		return
+	if ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_LEFT:
+		click_world = (ev.position - screen * 0.5 - shake_off) / zoom + cam
 	if ev is InputEventKey and ev.pressed and not ev.echo:
 		if ev.keycode == KEY_R and (game_over or victory):
 			get_tree().reload_current_scene()
@@ -500,7 +522,7 @@ func _apply_option(o: Dictionary, silent: bool) -> void:
 
 func _recompute_derived() -> void:
 	max_integrity = 4.0 if has("metal.fortress") else 3.0
-	pull_r = R * 2.4 * (1.5 if has("metal.magnet") else 1.0)
+	pull_r = R * 2.6 * (1.5 if has("metal.magnet") else 1.0)
 	var n := 0
 	if has("organic.base"):
 		n = 2 + (2 if has("organic.brood") else 0) + (4 if has("organic.hive") else 0)
@@ -731,7 +753,7 @@ func max_speed() -> float:
 	var m := 1.0
 	if has("wheel.base"):
 		m += 0.1 + (0.15 if has("wheel.afterburn") else 0.0)
-	return 3.4 * R * m * (1.0 - 0.45 * imbalance)
+	return 2.3 * R * m * (1.0 - 0.45 * imbalance)
 
 
 func _update_player(dt: float) -> void:
@@ -740,11 +762,15 @@ func _update_player(dt: float) -> void:
 	burst_cd -= dt
 	slam_cd -= dt
 	dash_t -= dt
-	var accel := 10.0 * R * (1.0 - 0.6 * imbalance) * (1.6 if has("wheel.traction") else 1.0)
+	var accel := 7.0 * R * (1.0 - 0.6 * imbalance) * (1.6 if has("wheel.traction") else 1.0)
 	var target := input_move.limit_length(1.0) * max_speed()
-	if dash_t <= 0.0:
-		pvel = pvel.move_toward(target, accel * dt)
+	_update_lurch(dt)
+	if dash_t <= 0.0 and lurch_state != 2:
+		# an ooze crawl: sluggish to get going, and it bleeds off lurch momentum fast
+		var over := pvel.length() > max_speed() * 1.05
+		pvel = pvel.move_toward(target, (16.0 * R if over else accel) * dt)
 	ppos += pvel * dt
+	_update_feelers(dt)
 
 	# Spin model: steering curls the hull, the heavy side swings to trail like a
 	# pendulum, and plain rolling adds a slow drift so every side gets a turn.
@@ -787,6 +813,150 @@ func _update_player(dt: float) -> void:
 		regen_t = 0.0
 		if integrity < max_integrity:
 			integrity = minf(max_integrity, integrity + 1.0)
+
+
+func lurch_range() -> float:
+	return R * (2.6 + 0.7 * rank("organic") + (1.5 if has("organic.hunters") else 0.0))
+
+
+func lurch_cooldown() -> float:
+	return 0.85 / (1.0 + 0.15 * rank("organic"))
+
+
+func _lurchable(th: Thing) -> bool:
+	if th.gone or th.dead or th.carried or th.grabbed or vis_alpha(th.r) <= 0.0:
+		return false
+	if th.enemy:
+		return true
+	return th.r < ABSORB * R or (th.loose >= 0.0 and th.r < LOOSE_ABSORB * R)
+
+
+func _pick_lurch_target(aim: Vector2, point: Vector2) -> Thing:
+	var reach := lurch_range()
+	var best: Thing = null
+	var bs := -INF
+	for list in [props, enemies]:
+		for th: Thing in list:
+			if not _lurchable(th):
+				continue
+			var to := th.pos - ppos
+			var gap := to.length() - th.r - R
+			if gap > reach:
+				continue
+			var sc: float
+			if point != Vector2.INF:
+				var dp := th.pos.distance_to(point)
+				if dp > th.r + R * 1.5:
+					continue
+				sc = -dp
+			else:
+				var align := aim.dot(to.normalized()) if aim.length() > 0.1 else 0.5
+				if aim.length() > 0.1 and align < 0.35:
+					continue
+				sc = align * 2.0 + minf(pow(th.r / R, 2.0) * 4.0, 1.0) - maxf(gap, 0.0) / reach * 0.6
+				if th.enemy and th.r >= ABSORB_LIVE * R:
+					sc -= 0.4
+			if sc > bs:
+				bs = sc
+				best = th
+	return best
+
+
+func _update_lurch(dt: float) -> void:
+	lurch_cd -= dt
+	match lurch_state:
+		0:
+			var clicked := click_world != Vector2.INF
+			if (want_lurch or clicked) and lurch_cd <= 0.0:
+				var aim := input_move if input_move.length() > 0.1 else pvel.normalized()
+				var tgt := _pick_lurch_target(aim, click_world)
+				if tgt != null:
+					lurch_target = tgt
+					lurch_state = 1
+					lurch_tip = ppos + (tgt.pos - ppos).normalized() * R
+					stats["lurches"] += 1
+			click_world = Vector2.INF
+		1:
+			if lurch_target == null or not _lurchable(lurch_target):
+				_end_lurch()
+				return
+			var tp := lurch_target.pos
+			lurch_tip = lurch_tip.move_toward(tp, R * 40.0 * dt)
+			if lurch_tip.distance_to(tp) <= lurch_target.r:
+				lurch_state = 2
+				lurch_t = 0.4
+		2:
+			if lurch_target == null or not _lurchable(lurch_target):
+				_end_lurch()
+				return
+			lurch_t -= dt
+			lurch_tip = lurch_target.pos
+			# spring the body at the latch point; it overshoots and settles on its own
+			var want := (lurch_target.pos - ppos) * 9.0
+			want = want.limit_length(R * 16.0)
+			pvel = pvel.lerp(want, 1.0 - exp(-18.0 * dt))
+			if lurch_t <= 0.0 or ppos.distance_to(lurch_target.pos) < R * 0.5 + lurch_target.r * 0.3:
+				_end_lurch()
+
+
+func _end_lurch() -> void:
+	lurch_state = 0
+	lurch_target = null
+	lurch_cd = lurch_cooldown()
+
+
+func _update_feelers(dt: float) -> void:
+	# Feeding tentacles: each one reaches for a morsel within reach and drags it in.
+	var n := mini(3 + rank("organic"), 9)
+	while feelers.size() < n:
+		feelers.append({"target": null, "tip": ppos, "latched": false})
+	var taken := {}
+	for f in feelers:
+		if f["target"] != null:
+			taken[f["target"]] = true
+	for f in feelers:
+		var tg = f["target"]
+		if tg != null and (tg.gone or tg.dead or tg.carried or vis_alpha(tg.r) <= 0.0 or tg.pos.distance_to(ppos) > pull_r * 1.4 + tg.r
+				or tg.r >= (ABSORB_LIVE if tg.enemy else ABSORB) * R):
+			taken.erase(tg)
+			f["target"] = null
+			f["latched"] = false
+			tg = null
+		if tg == null:
+			var best: Thing = null
+			var bd := INF
+			for list in [props, enemies]:
+				for th: Thing in list:
+					if th.gone or th.dead or th.carried or taken.has(th) or th == lurch_target or th.age < 0.0:
+						continue
+					if th.loose >= 0.0 and not has("metal.riveted"):
+						continue
+					if th.r >= (ABSORB_LIVE if th.enemy else ABSORB) * R or vis_alpha(th.r) <= 0.0:
+						continue
+					var d := th.pos.distance_to(ppos) - th.r
+					if d < pull_r and d < bd:
+						bd = d
+						best = th
+			if best != null:
+				f["target"] = best
+				taken[best] = true
+				tg = best
+		var tip: Vector2 = f["tip"]
+		if tg == null:
+			f["tip"] = tip.lerp(ppos, 1.0 - exp(-10.0 * dt))
+			continue
+		if not f["latched"]:
+			f["tip"] = tip.move_toward(tg.pos, R * 14.0 * dt)
+			if (f["tip"] as Vector2).distance_to(tg.pos) <= tg.r + R * 0.05:
+				f["latched"] = true
+		else:
+			var to: Vector2 = ppos - tg.pos
+			var d := to.length()
+			var k := 1.0 - clampf(d / (pull_r + tg.r), 0.0, 1.0)
+			tg.pos += to / maxf(d, 0.000001) * R * (1.5 + 5.0 * k) * dt
+			if tg.enemy:
+				tg.vel = tg.vel * 0.5
+			f["tip"] = tg.pos
 
 
 func _slam(ang: float) -> void:
@@ -921,7 +1091,7 @@ func absorb(th: Thing) -> void:
 			integrity = minf(max_integrity, integrity + 0.06)
 		if th.apex:
 			_apex_reward(th, "ATE")
-		elif th.r > 0.16 * R:
+		elif th.r > 0.3 * R:
 			var nm: String = th.d["name"]
 			if th.enemy:
 				nm += " (alive!)"
@@ -1517,7 +1687,22 @@ func _apex_ai(e: Thing, dt: float) -> void:
 	if e.state == 1 and e.st <= 0.0:
 		e.state = 0
 		e.wtarget = Vector2.from_angle(rng.randf() * TAU) * arena_r * rng.randf_range(0.2, 0.8)
-	if e.state == 1:
+	e.pounce_cd -= dt
+	if e.pounce > 0.0:
+		# telegraphed pounce: crouch, then launch at where you are now
+		e.pounce -= dt
+		e.vel = e.vel.lerp(Vector2.ZERO, 1.0 - exp(-10.0 * dt))
+		e.flash = 0.05 if int(e.pounce * 14.0) % 2 == 0 else 0.0
+		if e.pounce <= 0.0:
+			e.vel = dir * max_speed() * 3.4
+			e.pounce_cd = 3.5
+		return
+	if e.state == 1 and e.pounce_cd <= 0.0 and d - e.r - R < R * 4.0:
+		e.pounce = 0.55
+		return
+	if e.state == 1 and e.pounce_cd > 2.6:
+		e.vel = e.vel.lerp(Vector2.ZERO, 1.0 - exp(-1.5 * dt))
+	elif e.state == 1:
 		e.vel = e.vel.lerp(dir * max_speed() * 0.95, 1.0 - exp(-2.5 * dt))
 		if e.d.has("atk") and e.cd <= 0.0:
 			var atk: Dictionary = e.d["atk"]
@@ -1746,9 +1931,6 @@ func _player_collisions() -> void:
 		if edible:
 			if d < R + p.r * 0.5 and not (p.loose >= 0.0 and p.age < 0.35):
 				absorb(p)
-			elif d < pull_r + p.r and p.loose < 0.0 and p.age >= 0.0:
-				var f := 1.0 - d / (pull_r + p.r)
-				p.pos += to / maxf(d, 0.000001) * R * (1.0 + 6.0 * f) * dt
 		elif p.wreck or p.loose >= 0.0:
 			# oversized debris gets shoved around instead of blocking
 			var md2 := R + p.r * 0.8
@@ -1788,9 +1970,12 @@ func _player_collisions() -> void:
 			if e.apex:
 				stats["apex_hits"] += 1
 			player_hit((2.0 if e.apex else 1.4) * e.r / R * (1.5 if e.elite else 1.0), e.pos)
-			var crush := 1.5 * R * R * (0.5 + pvel.length() / max_speed())
+			var spd_f := minf(pvel.length() / max_speed(), 3.0)
+			var crush := 1.5 * R * R * (0.5 + spd_f)
 			if has("wheel.base"):
-				crush += 4.0 * R * R * (pvel.length() / max_speed()) * rank_mult("wheel") * (2.5 if has("wheel.battering") else 1.0)
+				crush += 4.0 * R * R * spd_f * rank_mult("wheel") * (2.5 if has("wheel.battering") else 1.0)
+			if lurch_state == 2 and lurch_target == e:
+				_end_lurch()
 			if has("metal.spikes"):
 				crush += 3.0 * R * R * rank_mult("metal")
 			hurt(e, crush)
@@ -1905,7 +2090,7 @@ func spawn_prop_cluster(initial: bool) -> void:
 		return
 	if rng.randf() < 0.12 and _spawn_theme(center, R, false):
 		return
-	var ratio := exp(lerpf(log(0.08), log(0.48), pow(rng.randf(), 1.3)))
+	var ratio := exp(lerpf(log(0.16), log(0.48), pow(rng.randf(), 1.3)))
 	var base_s := R * ratio
 	var n := rng.randi_range(4, 10)
 	var d0 := _pick_def(prop_sorted, base_s)
@@ -1934,7 +2119,7 @@ func spawn_enemy(at: Vector2 = Vector2.INF) -> Thing:
 	elif roll < 0.4 + 0.15 * p:
 		ratio = exp(rng.randf_range(log(0.55), log(1.3)))
 	else:
-		ratio = exp(rng.randf_range(log(0.12), log(0.42)))
+		ratio = exp(rng.randf_range(log(0.17), log(0.42)))
 	var s := R * ratio
 	if at == Vector2.INF:
 		at = _arena_spawn_point(s)
@@ -1973,9 +2158,9 @@ func _spawning(dt: float) -> void:
 	for p in props:
 		if p.gone or p.loose >= 0.0:
 			continue
-		if p.r < DUST * R:
+		if p.r < SEE_MIN * R:
 			p.gone = true
-			_dust(p)
+			_vanish(p)
 			continue
 		if p.fixed or p.wreck:
 			continue
@@ -2003,15 +2188,15 @@ func _spawning(dt: float) -> void:
 		if d > hd * 3.0:
 			e.dead = true
 			e.gone = true
-		elif e.r < DUST * R:
+		elif e.r < SEE_MIN * R:
 			e.dead = true
-			_dust(e)
+			_vanish(e)
 		else:
 			alive += 1
 	for e in apexes:
-		if not e.dead and e.r < DUST * R * 3.0:
+		if not e.dead and e.r < SEE_MIN * R:
 			e.dead = true
-			_dust(e)
+			_vanish(e)
 	spawn_acc += dt * (4.0 + 10.0 * p)
 	while spawn_acc >= 1.0 and alive < target_n:
 		spawn_acc -= 1.0
@@ -2020,11 +2205,14 @@ func _spawning(dt: float) -> void:
 	spawn_acc = minf(spawn_acc, 3.0)
 
 
-func _dust(th: Thing) -> void:
-	core_area += th.r * th.r * 0.4 * growth_eff()
-	integrity = minf(max_integrity, integrity + 0.01)
-	if dust.size() < 300 and th.pos.distance_to(ppos) < view_r * 1.5:
-		dust.append({"pos": th.pos, "t": 0.0})
+func _vanish(th: Thing) -> void:
+	# beneath notice: no mass, no essence, no healing. It just stops existing for you.
+	th.gone = true
+
+
+func vis_alpha(r: float) -> float:
+	# things fade out as they approach the visibility floor
+	return clampf((r / R - SEE_MIN) / (SEE_MIN * 0.4), 0.0, 1.0)
 
 
 func _update_strikes(dt: float) -> void:
@@ -2073,6 +2261,11 @@ func _update_camera(dt: float) -> void:
 	shake = maxf(0.0, shake - dt * 1.8)
 	shake_off = Vector2(rng.randf_range(-1, 1), rng.randf_range(-1, 1)) * shake * 10.0
 	_update_zoom()
+
+
+func _update_floor(dt: float) -> void:
+	var want: Color = zone_def.get("floor", floor_col)
+	floor_col = floor_col.lerp(want, 1.0 - exp(-1.5 * dt))
 
 
 func _update_zoom() -> void:
@@ -2214,7 +2407,12 @@ func _draw() -> void:
 
 
 func _draw_grid() -> void:
-	draw_rect(Rect2(Vector2.ZERO, screen), Color(0.07, 0.08, 0.1))
+	# outside the current zone is in shadow; the arena itself is lit floor
+	if arena_r < INF:
+		draw_rect(Rect2(Vector2.ZERO, screen), floor_col.darkened(0.45))
+		draw_circle(w2s(Vector2.ZERO), arena_r * zoom, floor_col)
+	else:
+		draw_rect(Rect2(Vector2.ZERO, screen), floor_col)
 	var span := view_r * 2.0
 	var s := pow(10.0, floorf(log(span / 4.0) / log(10.0)))
 	for level in 2:
@@ -2223,7 +2421,7 @@ func _draw_grid() -> void:
 		var alpha := clampf(1.0 - n_lines / 45.0, 0.0, 1.0) * (0.10 if level == 0 else 0.16)
 		if alpha <= 0.005:
 			continue
-		var col := Color(0.6, 0.7, 1.0, alpha)
+		var col := Color(floor_col.darkened(0.35), alpha * 2.2)
 		var tl := cam - screen * 0.5 / zoom
 		var br := cam + screen * 0.5 / zoom
 		var x := floorf(tl.x / step) * step
@@ -2237,9 +2435,6 @@ func _draw_grid() -> void:
 			draw_line(Vector2(0, sy), Vector2(screen.x, sy), col, 1.0)
 			y += step
 	# outside the current zone is darker: you're not supposed to be there yet
-	if arena_r < INF:
-		var c := w2s(Vector2.ZERO)
-		draw_arc(c, arena_r * zoom, 0, TAU, 128, Color(1, 1, 1, 0.08), maxf(2.0, wall_r * zoom * 2.5))
 	var bar_m := s
 	var px := bar_m * zoom
 	var o := Vector2(screen.x - 30 - px, screen.y - 28)
@@ -2270,6 +2465,10 @@ func _draw_props() -> void:
 			fill = fill.darkened(0.45)
 			fill.a = 0.75 * clampf((9.0 - p.age) / 2.0, 0.0, 1.0)
 			sh = 0
+		var va := vis_alpha(p.r)
+		if va <= 0.0:
+			continue
+		fill.a *= va
 		var grow := clampf(p.age / 0.3, 0.0, 1.0) if p.age >= 0.0 else 1.0
 		sr *= grow
 		var outline := Color(0.55, 1.0, 0.65, 0.9) if edible else Color(0.0, 0.0, 0.0, 0.7)
@@ -2284,6 +2483,7 @@ func _draw_props() -> void:
 			if blink:
 				fill = Color(1, 0.4, 0.3)
 			draw_arc(c, sr + 4.0, -PI * 0.5, -PI * 0.5 + TAU * clampf(p.loose / LOOSE_TIME, 0.0, 1.0), 24, Color(1, 0.8, 0.3), 2.0)
+		outline.a *= va
 		_shape(sh, c, sr, p.rot, fill, outline, ow)
 		if p.wreck:
 			draw_line(c + Vector2(-sr, -sr) * 0.5, c + Vector2(sr, sr) * 0.5, Color(0, 0, 0, 0.6), maxf(1.0, sr * 0.12))
@@ -2320,7 +2520,11 @@ func _draw_enemies() -> void:
 		if e.flash > 0.0:
 			fill = fill.lerp(Color(1, 1, 1), 0.5)
 		var edible := e.r < ABSORB_LIVE * R
-		var outline := Color(0.55, 1.0, 0.65) if edible else Color(1.0, 0.25, 0.2)
+		var va := vis_alpha(e.r)
+		if va <= 0.0:
+			continue
+		fill.a *= va
+		var outline := Color(0.55, 1.0, 0.65, va) if edible else Color(1.0, 0.25, 0.2)
 		if e.apex and not edible:
 			var pulse := 0.5 + 0.5 * sin(t * (9.0 if e.state == 1 else 3.0))
 			draw_arc(c, sr * 1.25, 0, TAU, 48, Color(1.0, 0.2, 0.15, 0.3 + 0.5 * pulse * (1.0 if e.state == 1 else 0.4)), maxf(2.0, sr * 0.08))
@@ -2379,65 +2583,115 @@ func _draw_boss(e: Thing) -> void:
 	_label(c, "RIVAL", sr * 0.6, Color(1, 0.6, 0.7))
 
 
+func _tentacles() -> Array:
+	# every pseudopod currently reaching out: feeders plus the lurch arm
+	var out := []
+	var i := 0
+	for f in feelers:
+		i += 1
+		if f["target"] == null and (f["tip"] as Vector2).distance_to(ppos) < R * 1.05:
+			continue
+		out.append({"tip": f["tip"], "w": 0.16, "latched": f["latched"], "seed": float(i)})
+	if lurch_state > 0:
+		out.append({"tip": lurch_tip, "w": 0.34, "latched": lurch_state == 2, "seed": 0.0})
+	return out
+
+
+func _draw_tentacle(tip: Vector2, w0: float, latched: bool, seed: float) -> void:
+	var to := tip - ppos
+	var L := to.length()
+	if L < R * 0.9:
+		return
+	var dir := to / L
+	var nrm := dir.orthogonal()
+	var base := ppos + dir * R * 0.75
+	var span := tip - base
+	var bend := sin(t * 5.0 + seed * 1.7) * span.length() * 0.18
+	var ctrl := base + span * 0.5 + nrm * bend
+	var n := 12
+	var left := PackedVector2Array()
+	var right := PackedVector2Array()
+	var pts := []
+	for k in n + 1:
+		var u := float(k) / n
+		var p := base.lerp(ctrl, u).lerp(ctrl.lerp(tip, u), u)
+		pts.append(p)
+	for k in n + 1:
+		var u := float(k) / n
+		var p: Vector2 = pts[k]
+		var tang: Vector2 = ((pts[mini(k + 1, n)] as Vector2) - (pts[maxi(k - 1, 0)] as Vector2)).normalized()
+		var w := R * w0 * lerpf(1.0, 0.28, u) * (1.0 + 0.12 * sin(u * 9.0 - t * 8.0))
+		left.append(w2s(p + tang.orthogonal() * w))
+		right.append(w2s(p - tang.orthogonal() * w))
+	right.reverse()
+	left.append_array(right)
+	draw_colored_polygon(left, OOZE)
+	draw_circle(w2s(tip), maxf(2.0, R * w0 * 0.55 * zoom), OOZE)
+	# cells stream out to forage, then back along a latched arm carrying food
+	for k in 3:
+		var u := fposmod(t * 1.4 + k / 3.0 + seed * 0.37, 1.0)
+		if latched:
+			u = 1.0 - u
+		var idx := clampi(int(u * n), 0, n)
+		var cp: Vector2 = pts[idx]
+		draw_circle(w2s(cp), maxf(1.5, R * w0 * 0.35 * zoom), Color(0.32, 0.22, 0.42, 0.9))
+
+
+func _membrane(c: Vector2, sr: float, tents: Array, shrink: float) -> PackedVector2Array:
+	var sp := pvel.length()
+	var st := clampf(sp / maxf(max_speed() * 5.0, 0.0001), 0.0, 0.32)
+	var va := pvel.angle()
+	var pts := PackedVector2Array()
+	var n := 64
+	for k in n:
+		var th := TAU * k / n
+		var ph := th - hull_ang
+		var wob := 1.0 + 0.045 * sin(3.0 * ph + t * 1.7) + 0.03 * sin(5.0 * ph - t * 2.6) + 0.018 * sin(8.0 * ph + t * 4.1)
+		var phi := th - va
+		var ell := 1.0 / sqrt(pow(cos(phi) / (1.0 + st), 2.0) + pow(sin(phi) / (1.0 - 0.4 * st), 2.0))
+		var bulge := 0.0
+		for tt in tents:
+			var ta: float = ((tt["tip"] as Vector2) - ppos).angle()
+			var dd := angle_difference(th, ta)
+			bulge += (0.5 * float(tt["w"])) * exp(-pow(dd / 0.32, 2.0))
+		pts.append(c + Vector2.from_angle(th) * sr * (wob * ell + bulge) * shrink)
+	return pts
+
+
 func _draw_player() -> void:
 	var c := w2s(ppos)
 	var sr := R * zoom
-	if pull_r > 0.0:
-		draw_arc(c, pull_r * zoom, 0, TAU, 64, Color(0.6, 0.5, 1.0, 0.12), 1.0)
 	if has("fire.halo") or has("fire.inferno"):
 		var er := R * (3.2 if has("fire.inferno") else 1.9) * zoom
-		draw_circle(c, er, Color(1.0, 0.45, 0.1, 0.05))
-		draw_arc(c, er * (0.97 + 0.03 * sin(t * 9.0)), 0, TAU, 48, Color(1.0, 0.5, 0.15, 0.35), 2.0)
+		draw_circle(c, er, Color(1.0, 0.45, 0.1, 0.07))
+		draw_arc(c, er * (0.97 + 0.03 * sin(t * 9.0)), 0, TAU, 48, Color(1.0, 0.5, 0.15, 0.45), 2.0)
 	for s in sparks:
 		var a: float = s["t"] / 2.5
-		draw_circle(w2s(s["pos"]), maxf(1.5, s["r"] * zoom * 0.25), Color(0.5, 0.9, 1.0, a * 0.7))
+		draw_circle(w2s(s["pos"]), maxf(1.5, s["r"] * zoom * 0.25), Color(0.5, 0.9, 1.0, a * 0.8))
 	if syn_active.has("blender"):
 		var n: int = 2 + syn_active["blender"]["links"].size()
 		for i in n:
 			var ha := halberd_ang + TAU * i / n
 			var hp := w2s(ppos + Vector2.from_angle(ha) * R * 2.1)
 			var dirv := Vector2.from_angle(ha + PI * 0.5)
-			draw_line(hp - dirv * sr * 0.45, hp + dirv * sr * 0.45, Color(0.7, 0.9, 1.0, 0.85), maxf(2.0, sr * 0.08))
+			draw_line(hp - dirv * sr * 0.45, hp + dirv * sr * 0.45, Color(0.85, 0.95, 1.0, 0.9), maxf(2.0, sr * 0.08))
 	if has("blade.orbit"):
 		for i in 3:
 			var bp := w2s(ppos + Vector2.from_angle(blade_ang + TAU * i / 3.0) * R * 2.0)
 			_shape(4, bp, sr * 0.3, blade_ang * 2.0 + i, Color(0.85, 0.85, 1.0), Color(0, 0, 0, 0.6), 1.0)
 	for cr in critters:
 		var cp := w2s(cr["pos"])
-		draw_circle(cp, maxf(3.0, sr * 0.16), Color(0.55, 0.95, 0.45))
-		draw_circle(cp, maxf(1.5, sr * 0.07), Color(0.1, 0.25, 0.1))
-	# core
-	var core_frac := clampf(core_area / maxf(R * R / GROWTH, 0.0001), 0.0, 1.0)
-	var core_col := Color(0.22, 0.12, 0.32).lerp(Color(0.85, 0.35, 1.0), core_frac)
-	if iframes > 0.0 and int(iframes * 20) % 2 == 0:
-		core_col = Color(1, 0.4, 0.4)
-	draw_circle(c, sr, core_col)
-	var bi := 0
-	for it in items:
-		if it.surface:
-			continue
-		bi += 1
-		if bi > 70:
-			break
-		var a := hull_ang + it.ang
-		var rr := sr * (0.25 + 0.6 * fposmod(it.wob, 1.0))
-		var col: Color = it.d["col"]
-		draw_circle(c + Vector2.from_angle(a) * rr, maxf(1.0, it.r * zoom * 0.7), col.darkened(0.5))
-	draw_circle(c, sr * 0.35 * (0.6 + core_frac), Color(1.0, 0.7, 1.0, 0.25 + 0.5 * core_frac))
-	for i in 3:
-		var a := hull_ang + TAU * i / 3.0
-		draw_line(c + Vector2.from_angle(a) * sr * 0.4, c + Vector2.from_angle(a) * sr * 0.95, Color(1, 1, 1, 0.12), 2.0)
-	draw_arc(c, sr, 0, TAU, 48, Color(0.75, 0.6, 1.0), 2.0)
-	for id in syn_active:
-		var sa: Dictionary = syn_active[id]
-		var cp := w2s(item_world(sa["cat"])[0])
-		for o in sa["links"]:
-			draw_line(cp, w2s(item_world(o)[0]), Color(0.5, 1.0, 1.0, 0.5), 2.0)
+		draw_circle(cp, maxf(3.0, sr * 0.16), OOZE)
+		draw_circle(cp, maxf(1.5, sr * 0.07), Color(0.55, 0.95, 0.45))
+	var tents := _tentacles()
+	for tt in tents:
+		_draw_tentacle(tt["tip"], tt["w"], tt["latched"], tt["seed"])
+	# hull pieces sit half-sunk in the ooze: draw them, then the membrane over their inner half
 	for it in items:
 		if not it.surface:
 			continue
 		var a := hull_ang + it.ang
-		var p := w2s(ppos + Vector2.from_angle(a) * (R + it.r * 0.2))
+		var p := w2s(ppos + Vector2.from_angle(a) * (R + it.r * 0.25))
 		var isr := it.r * zoom
 		var col: Color = it.d["col"]
 		if it.creature:
@@ -2447,7 +2701,51 @@ func _draw_player() -> void:
 				draw_line(p, p + Vector2.from_angle(la) * isr * 1.5, col.darkened(0.4), maxf(1.0, isr * 0.2))
 		var bc := _branch_col(it.d)
 		_shape(int(it.d.get("sh", 0)) if not it.creature else 0, p, isr, a, col, bc if bc.a > 0.0 else Color(0, 0, 0, 0.6), maxf(1.0, isr * (0.14 if bc.a > 0.0 else 0.08)))
-		_label(p, String(it.d["lbl"]), isr, Color(0, 0, 0, 0.75) if col.get_luminance() > 0.45 else Color(1, 1, 1, 0.85))
+	var body := _membrane(c, sr, tents, 1.0)
+	draw_colored_polygon(body, OOZE)
+	# what's inside: buried junk as faint silhouettes and the crushed core's glow
+	var bi := 0
+	for it in items:
+		if it.surface:
+			continue
+		bi += 1
+		if bi > 30:
+			break
+		var a := hull_ang + it.ang
+		var rr := sr * (0.2 + 0.6 * fposmod(it.wob, 1.0))
+		var col: Color = it.d["col"]
+		draw_circle(c + Vector2.from_angle(a) * rr, maxf(1.0, it.r * zoom * 0.6), Color(col.darkened(0.6), 0.16))
+	var core_frac := clampf(core_area / maxf(R * R / GROWTH, 0.0001), 0.0, 1.0)
+	draw_circle(c, sr * 0.42 * (0.6 + core_frac), Color(0.45, 0.18, 0.65, 0.14 + 0.2 * core_frac))
+	draw_circle(c, sr * 0.2 * (0.6 + core_frac), Color(0.75, 0.4, 1.0, 0.18 + 0.35 * core_frac))
+	# oily sheen: a thin iridescent highlight on the upper-left of the membrane
+	var shine := _membrane(c, sr, tents, 0.86)
+	var arc := PackedVector2Array()
+	var arc2 := PackedVector2Array()
+	for k in shine.size():
+		var th := TAU * k / shine.size()
+		if th > PI * 1.05 and th < PI * 1.55:
+			arc.append(shine[k])
+		if th > PI * 1.6 and th < PI * 1.8:
+			arc2.append(shine[k])
+	if arc.size() > 1:
+		draw_polyline(arc, Color(0.62, 0.55, 0.85, 0.55), maxf(1.5, sr * 0.06))
+	if arc2.size() > 1:
+		draw_polyline(arc2, Color(0.4, 0.8, 0.8, 0.35), maxf(1.0, sr * 0.04))
+	draw_circle(c + Vector2.from_angle(PI * 1.3) * sr * 0.55, maxf(1.5, sr * 0.07), Color(1, 1, 1, 0.45))
+	body.append(body[0])
+	var hurt_flash := iframes > 0.0 and int(iframes * 16) % 2 == 0
+	draw_polyline(body, Color(1.0, 0.25, 0.3, 0.9) if hurt_flash else Color(0, 0, 0, 0.85), maxf(1.5, sr * (0.07 if hurt_flash else 0.03)))
+	for it in items:
+		if it.surface:
+			var p := w2s(ppos + Vector2.from_angle(hull_ang + it.ang) * (R + it.r * 0.25))
+			var col: Color = it.d["col"]
+			_label(p + Vector2.from_angle(hull_ang + it.ang) * it.r * zoom * 0.3, String(it.d["lbl"]), it.r * zoom, Color(0, 0, 0, 0.75) if col.get_luminance() > 0.45 else Color(1, 1, 1, 0.85))
+	for id in syn_active:
+		var sa: Dictionary = syn_active[id]
+		var cp := w2s(item_world(sa["cat"])[0])
+		for o in sa["links"]:
+			draw_line(cp, w2s(item_world(o)[0]), Color(0.5, 1.0, 1.0, 0.6), 2.0)
 	# branch focus markers: where each ability fires from
 	for b in Defs.TREE:
 		if rank(b["tag"]) <= 0 or b["tag"] in ["metal", "wheel", "organic"]:
@@ -2459,9 +2757,9 @@ func _draw_player() -> void:
 		draw_colored_polygon(PackedVector2Array([tip, bse + side, bse - side]), b["col"])
 	if imbalance > 0.04:
 		var ha := hull_ang + com.angle()
-		draw_circle(c + Vector2.from_angle(ha) * sr * 0.7, maxf(3.0, sr * imbalance * 0.6), Color(1.0, 0.8, 0.3, 0.7))
+		draw_circle(c + Vector2.from_angle(ha) * sr * 0.6, maxf(3.0, sr * imbalance * 0.5), Color(1.0, 0.8, 0.3, 0.6))
 	if burst_t > 0.0:
-		draw_arc(c, sr * 1.6, hull_ang, hull_ang + PI * 1.5, 32, Color(0.85, 0.65, 1.0, 0.6), 3.0)
+		draw_arc(c, sr * 1.6, hull_ang, hull_ang + PI * 1.5, 32, Color(0.25, 0.15, 0.35, 0.7), 3.0)
 
 
 func _draw_fx() -> void:
@@ -2534,7 +2832,7 @@ func _draw_hud() -> void:
 		draw_rect(Rect2(16, 142, 200 * f, 8), Color(0.8, 0.5, 1.0))
 		_hud_text(Vector2(222, 151), "collapse @ " + fmt_len(nxt * 2.0), 12, Color(0.8, 0.7, 1.0))
 	_hud_text(Vector2(16, 172), "lopsided %d%%" % int(imbalance / 0.6 * 100.0), 12, Color(1.0, 0.85, 0.4) if imbalance > 0.06 else Color(0.6, 0.6, 0.65))
-	var bc := "SPIN BURST ready" if burst_cd <= 0.0 else "spin burst %.0fs" % burst_cd
+	var bc := "CHURN ready" if burst_cd <= 0.0 else "churn %.0fs" % burst_cd
 	_hud_text(Vector2(120, 172), bc, 12, Color(0.85, 0.7, 1.0) if burst_cd <= 0.0 else Color(0.5, 0.5, 0.55))
 	_draw_tree_panel()
 	_draw_apex_markers()
@@ -2559,7 +2857,7 @@ func _draw_hud() -> void:
 		draw_string(font, Vector2((screen.x - w2) * 0.5, by + 24), sub, HORIZONTAL_ALIGNMENT_LEFT, -1, 15, Color(0.85, 0.85, 0.9, a))
 		by += 74
 	if not bot_mode:
-		_hud_text(Vector2(16, screen.y - 14), "WASD roll · Q/E nudge spin · SPACE spin-burst · F12 screenshot", 12, Color(0.6, 0.6, 0.65))
+		_hud_text(Vector2(16, screen.y - 14), "WASD crawl · SPACE / click lurch · SHIFT churn · Q/E nudge spin · F12 screenshot", 12, Color(0.6, 0.6, 0.65))
 	else:
 		_hud_text(Vector2(16, screen.y - 14), "AUTOPILOT", 12, Color(0.6, 0.9, 0.6))
 

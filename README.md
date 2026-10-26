@@ -5,14 +5,26 @@ smaller than you welds onto your hull, and what you eat decides what you become.
 No art yet: shapes, labels and colors only. The point is to test the mechanics.
 
 ```
-./run.sh                 # play (WASD roll · Q/E nudge spin · SPACE spin-burst · 1/2/3 or click to pick a fork · F12 screenshot · R restart)
+./run.sh                 # play (WASD crawl · SPACE or click: lurch · SHIFT churn · Q/E nudge spin · 1/2/3 to pick a fork · F12 screenshot · R restart)
 ./run.sh --bot           # watch the autopilot play
 ./run.sh --minutes=8     # compressed run (the scale schedule compresses with it)
 ./run.sh --start_r=30 --start_t=720    # jump to a later zone for testing (ranks auto-picked)
 ./run.sh --bot --shots=/tmp/cm --shot_every=30 --quit_after=1260   # fast playtest + screenshots + telemetry
+.tools/godot --headless --path . --fixed-fps 60 -- --bot --seed=6 --bot_focus=electric --quit_after=1260   # telemetry only, autopilot eats for one branch
 ```
 
 `run.sh` uses the local Godot binary in `.tools/godot` (gitignored), or `godot` on your PATH if that's missing.
+
+## The player: a black ooze
+
+You're a slime mold, not a ball:
+- **Crawl.** WASD moves you slowly and fluidly. Momentum carries, and the ooze sheds excess speed quickly.
+- **Lurch.** Space, or a click near a target, shoots a pseudopod at something in your aim direction within range. It latches on, and the body snaps after it and overshoots. It only fires at a target (food, prey, or an enemy to ram), never into empty space. Swarm (organic) ranks and the Hunters node increase the range and shorten the cooldown. Lurching into something bigger than you still strips pieces off.
+- **Feeding tentacles.** 3 + Swarm-rank feelers reach for nearby food and prey and drag it in, with cells streaming along them. They replace the old invisible gravity pull. Shed pieces still have to be rolled over.
+- **Churn.** Shift churns the hull (the old spin-burst). Absorbed objects sit half-sunk in the membrane, and abilities still fire from the side where their material is concentrated.
+- **Visibility floor.** Anything smaller than 12% of your radius fades out and is gone: no mass, no essence, no healing. Each size band has its own mix of tags, and once you outgrow a band you lose access to it, so what you eat while you're a given size shapes your tree.
+
+Each zone has its own floor (terracotta tile, teal carpet, grass, asphalt, concrete, slate, sand), and anything outside the current zone's walls is shaded.
 
 ## What's implemented
 
@@ -48,6 +60,11 @@ Second round (zones, apexes, local wildlife, essence tree):
 - **Essence economy.** First pass: about 25 picks with every branch maxed by 7:00. Then 8 picks with only Bulwark maxed, because half the objects carried a metal tag. Now an object's essence is split across its tags, incidental metal tags are gone, and rank price scales with your total ranks.
 - **Late zones starved.** By the end of a zone the whole arena fits on screen, so "spawn just off-screen, inside the walls" found nowhere to put things. Food and wildlife stopped, the player shrank, and the rival out-ate them for a loss. Things can now spawn in view, away from the player, with a grow-in animation.
 - **Rival snowball.** The rival could keep eating props and outgrow you indefinitely. Its growth from eating is now capped at 2.2× your size.
+
+Third round (ooze movement, visibility floor):
+
+- **Is diet strategic?** With the floor in, a bot that favors one branch ends noticeably higher in it on the same seed: electric-focused reached Storm 4 vs 2, and blade-focused reached Shrapnel 3 vs 2. Swarm used to max in every run because most creatures were tagged only organic. Creatures now carry a second tag (dogs: blade, soldiers: metal, kaiju: fire...).
+- **Movement.** With the slower crawl, the autopilot lurches about 900 times per run, and zone pacing is unchanged. Apexes got a telegraphed pounce so lurching away isn't a free escape (about 8 apex hits per run, up from about 4).
 
 Still open: the autopilot dodges well and almost never has its core breached outside the rival fight, so difficulty for a real player is unknown. The bot picks forks at random, so it doesn't test build strategy. Every enemy at the 2 km+ range is a "serpent" or "leviathan" because the roster runs out.
 
