@@ -1192,6 +1192,7 @@ func _apex_strike(e: Thing) -> void:
 	if iframes > 0.0 or game_over or victory:
 		return
 	stats["apex_hits"] += 1
+	print("EVENT t=%.2f frame=%d STRIKE %s" % [t, frames, e.d["lbl"]])
 	var n := (ppos - e.pos).normalized()
 	var k := mini(clampi(int(1.2 * e.r / R) + 1, 2, 6), surface_count())
 	_core_breach("%s STRIKE" % String(e.d["lbl"]))
@@ -1566,6 +1567,7 @@ func _terrain_effects(dt: float) -> Dictionary:
 		if float(terrain_tick[tp]) <= 0.0:
 			terrain_tick[tp] = every
 			stats["terrain_hits"] += 1
+			print("EVENT t=%.2f frame=%d TERRAIN %s" % [t, frames, tp])
 			var power := 1.4 if td.has("corrode") else 1.0
 			var src := ppos + Vector2.from_angle(rng.randf() * TAU) * R
 			player_hit(power, src)
