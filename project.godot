@@ -1,0 +1,26 @@
+; Engine configuration file.
+config_version=5
+
+[application]
+
+config/name="Critical Mass"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.7")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+window/vsync/vsync_mode=1
+
+[physics]
+
+common/physics_ticks_per_second=60
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+anti_aliasing/quality/msaa_2d=2
+environment/defaults/default_clear_color=Color(0.07, 0.08, 0.1, 1)
