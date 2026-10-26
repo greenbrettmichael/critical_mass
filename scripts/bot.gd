@@ -58,7 +58,7 @@ func think(g, dt: float) -> Dictionary:
 			continue
 		var to: Vector2 = pos - e.pos
 		var d: float = to.length()
-		if e == g.boss:
+		if e.rival:
 			continue
 		if e.r < g.ABSORB_LIVE * R:
 			continue
@@ -115,8 +115,9 @@ func think(g, dt: float) -> Dictionary:
 			avoid += to / maxf(d, 0.0001) * 5.0 * (sight * 1.3 - d) / sight
 
 	# the rival ooze: hunt it when it's smaller, give it room when even, flee when bigger
-	var boss = g.boss
-	if boss != null and not boss.dead:
+	for boss in g.rivals:
+		if boss.dead:
+			continue
 		var to: Vector2 = boss.pos - pos
 		var d: float = to.length()
 		var rel: float = boss.r / R
@@ -128,6 +129,7 @@ func think(g, dt: float) -> Dictionary:
 			threats += 2 if w > 0.0 else 0
 		elif d < R * 3.0 + boss.r:
 			avoid += -to.normalized() * 0.8
+
 	# the goal: once the planet core is edible, go eat it
 	var core = g.core
 	if core != null and not core.gone and R >= g.TARGET_R:
