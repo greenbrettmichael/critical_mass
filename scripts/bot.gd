@@ -114,20 +114,24 @@ func think(g, dt: float) -> Dictionary:
 			threats += 2
 			avoid += to / maxf(d, 0.0001) * 5.0 * (sight * 1.3 - d) / sight
 
+	# the rival ooze: hunt it when it's smaller, give it room when even, flee when bigger
 	var boss = g.boss
 	if boss != null and not boss.dead:
 		var to: Vector2 = boss.pos - pos
 		var d: float = to.length()
-		if boss.r < R * 0.8:
+		var rel: float = boss.r / R
+		if rel < 0.8 and d < R * 12.0 + boss.r:
 			seek = to.normalized() * 2.0
-		else:
-			# fight inside ability range, circling; back off when it winds up a lunge
-			var orbit: Vector2 = to.normalized().orthogonal()
-			var desired: float = boss.r + (R * 6.0 if boss.state != 0 else R * 2.2)
-			var radial: Vector2 = -to.normalized() * clampf((desired - d) / (R * 2.0), -1.0, 1.5)
-			seek = seek * 0.6 + orbit * 0.7 + radial * 1.2
-		if d < R * 10.0 + boss.r:
-			out["burst"] = true
+		elif rel > 1.2:
+			var w: float = clampf((R * 9.0 + boss.r - d) / (R * 4.0), 0.0, 2.0)
+			avoid += -to.normalized() * 3.0 * w
+			threats += 2 if w > 0.0 else 0
+		elif d < R * 3.0 + boss.r:
+			avoid += -to.normalized() * 0.8
+	# the goal: once the planet core is edible, go eat it
+	var core = g.core
+	if core != null and not core.gone and core.r < g.ABSORB * R:
+		seek = (core.pos - pos).normalized() * 2.5
 
 	var mv := seek + avoid
 	if escape_t > 0.0:

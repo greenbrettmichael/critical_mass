@@ -31,6 +31,7 @@ const APEX_HP := 70.0
 const ESS_BASE := 3.0       # essence for the next rank; every rank you own (any branch)
 const ESS_GROW := 1.2       # multiplies the price of the next one, so diet picks the branch
 const MAX_RANK := 5
+const TARGET_R := 1400.0   # eat the planet core once you're this big (2.8 km across)
 
 class Thing:
 	var d: Dictionary
@@ -71,6 +72,8 @@ class Thing:
 	var calm := 0.0         # apex backs off after a strike
 	var dmg_by := {}        # apex/rival damage attribution, for tuning
 	var feelers := []       # the rival's feeding tentacles
+	var target: Thing = null # the rival's current forage target
+	var retarget := 0.0
 
 class HullItem:
 	var d: Dictionary
@@ -140,7 +143,7 @@ var com := Vector2.ZERO # hull-local center-of-mass offset
 var imbalance := 0.0
 var slam_cd := 0.0
 var collapse_idx := 0
-var stats := {"terrain_hits": 0, "terrain_time": 0.0, "rival_ate": 0, "lurches": 0, "synergies": 0, "absorbed": 0, "kills": 0, "shed": 0, "recovered": 0, "lost": 0, "slams": 0,
+var stats := {"rival_eaten": 0, "rival_strikes": 0, "terrain_hits": 0, "terrain_time": 0.0, "rival_ate": 0, "lurches": 0, "synergies": 0, "absorbed": 0, "kills": 0, "shed": 0, "recovered": 0, "lost": 0, "slams": 0,
 	"collapses": 0, "hits": 0, "core_hits": 0, "apex_kills": 0, "apex_hits": 0, "picks": 0}
 var regen_t := 0.0
 var game_over := false
@@ -180,8 +183,9 @@ var terrain_tick := {}   # type -> countdown to the next piece lost
 var props: Array[Thing] = []
 var enemies: Array[Thing] = []
 var bullets: Array[Bullet] = []
-var boss: Thing = null
-var boss_spawned := false
+var boss: Thing = null   # the rival ooze (always around; reforms after being eaten)
+var rival_reform := 0.0
+var core: Thing = null    # the planet core: the end goal
 var strike_cd := 8.0
 var strikes := []
 var spawn_acc := 0.0
@@ -286,6 +290,8 @@ func _ready() -> void:
 	for i in 10:
 		spawn_enemy()
 	syn_seen = syn_active.duplicate()
+	if not apex_test:
+		_spawn_rival(1.0, true)
 	if apex_test and not apexes.is_empty():
 		var ax: Thing = apexes[0]
 		ax.pos = ppos + Vector2(R * 7.0 + ax.r, 0)
@@ -383,7 +389,7 @@ func _physics_process(dt: float) -> void:
 		_update_strikes(dt)
 		_check_collapse()
 		_check_zone()
-		_check_boss()
+		_check_rival(dt)
 	_cleanup()
 	_update_camera(dt)
 	_update_floor(dt)
@@ -1105,6 +1111,9 @@ func place_item(it: HullItem) -> void:
 
 
 func absorb(th: Thing) -> void:
+	if th == core:
+		_win_core()
+		return
 	var it := HullItem.new()
 	it.d = th.d
 	it.r = th.r
@@ -1418,7 +1427,7 @@ func _setup_zone(i: int) -> void:
 	if hi <= 0.0:
 		arena_r = INF
 		wall_r = 0.0
-		banner(String(zone_def["name"]), "no walls left. grow.")
+		_spawn_core()
 		return
 	var lo := float(zone_def["lo"])
 	arena_r = ARENA_K * hi
@@ -1996,67 +2005,172 @@ func player_hit(power: float, src: Vector2, who: String = "") -> void:
 # Boss: rival singularity
 # =============================================================================
 
-func _check_boss() -> void:
-	if boss_spawned or t < run_len:
-		return
-	boss_spawned = true
+func _spawn_rival(scale: float, first: bool) -> void:
 	var e := Thing.new()
 	e.d = Defs.BOSS
 	e.enemy = true
-	e.r = R * 1.8
+	e.r = maxf(R0, R * scale)
 	e.hp = e.r * e.r
 	e.max_hp = e.hp
-	var a := rng.randf() * TAU
-	e.pos = ppos + Vector2.from_angle(a) * view_r * 1.3
-	for i in 26:
+	var at := ppos + Vector2.from_angle(rng.randf() * TAU) * (R * 14.0 if first else _view_half_diag() * 1.2)
+	if not first:
+		var p := _arena_spawn_point(e.r)
+		if p != Vector2.INF:
+			at = p
+	e.pos = at
+	for i in 14:
 		e.parts.append({"a": rng.randf() * TAU, "s": rng.randf_range(0.12, 0.3), "c": Color.from_hsv(rng.randf(), 0.5, 0.7), "sh": rng.randi() % 5})
 	boss = e
 	enemies.append(e)
-	banner("RIVAL SINGULARITY", "a planetary defense anomaly. out-mass it, then eat it.")
-	shake = 1.2
+	if first:
+		banner("A RIVAL OOZE", "it wants the planet core too. eat it while you're bigger, run while you're not")
+	else:
+		banner("THE RIVAL REFORMS", "it's back at your size, and hungry")
+
+
+func _check_rival(dt: float) -> void:
+	if boss == null and not apex_test:
+		rival_reform -= dt
+		if rival_reform <= 0.0:
+			_spawn_rival(0.95, false)
+
+
+func _spawn_core() -> void:
+	var d := {"name": "Planet Core", "lbl": "PLANET CORE", "col": Color(1.0, 0.55, 0.15), "sh": 0, "tags": ["fire", "metal"], "r": TARGET_R * ABSORB * 0.95, "den": 20.0}
+	var th := Thing.new()
+	th.d = d
+	th.r = float(d["r"])
+	th.pos = Vector2.ZERO
+	th.fixed = true
+	th.age = 10.0
+	props.append(th)
+	core = th
+	banner("THE PLANET CORE", "grow to %s across and consume it before the rival does" % fmt_len(TARGET_R * 2.0))
+
+
+func _win_core() -> void:
+	victory = true
+	core.gone = true
+	ring(ppos, R * 12.0, Color(1, 0.7, 0.3), 1.5)
+	shake = 1.5
+	print("VICTORY at T=%.1f (core eaten at %s)" % [t, fmt_len(R * 2.0)])
+	banner("CRITICAL MASS ACHIEVED", "you consumed the planet core · %s across" % fmt_len(R * 2.0))
+
+
+func _lose(why: String) -> void:
+	game_over = true
+	print("DEFEAT at T=%.1f (%s)" % [t, why])
+	banner("SINGULARITY COLLAPSED", why)
+
+
+func _eat_rival() -> void:
+	# a big meal, not the end: it reforms in a minute
+	var e := boss
+	core_area += e.r * e.r / GROWTH * 0.35 * growth_eff()
+	for tg in ranks:
+		if rank(tg) > 0:
+			essence[tg] = float(essence[tg]) + 3.0
+	for tg in tree_by_tag:
+		_gain_essence({"tags": [tg]}, 0.0)
+	e.dead = true
+	stats["rival_eaten"] += 1
+	rival_reform = 45.0
+	recompute_size()
+	ring(ppos, R * 6.0, Color(1, 0.4, 0.5), 0.8)
+	shake = maxf(shake, 0.9)
+	print("EVENT t=%.2f frame=%d ATE RIVAL" % [t, frames])
+	banner("RIVAL CONSUMED", "it will reform in 45 seconds")
+
+
+func _rival_eff(e: Thing) -> float:
+	# the rival is held to the same growth curve you are, plus a little catch-up
+	var eff := clampf(pow(sched_r() / e.r, 1.5), 0.08, 2.0)
+	if e.r < R * 0.85:
+		eff *= 1.8
+	if e.r > R * 1.6:
+		eff = 0.0
+	return eff
 
 
 func _boss_ai(e: Thing, dt: float) -> void:
-	e.r = sqrt(maxf(e.hp, 0.0001))
+	# The rival forages near you (that's where the food is), flees apexes, hunts
+	# you when it's bigger, runs when it's smaller, and races you to the core.
+	e.r = sqrt(maxf(e.hp, 0.00000001))
 	e.rot += dt * 0.8
+	e.st -= dt
 	var to := ppos - e.pos
 	var d := to.length()
 	var dir := to / maxf(d, 0.0001)
-	var spd := max_speed() * 0.78
-	match e.state:
-		0:
-			e.vel = e.vel.lerp(dir * spd, 1.0 - exp(-2.5 * dt))
-			e.st -= dt
-			if e.st <= 0.0:
-				e.st = 6.0
-				e.state = 1
-				e.cd = 0.6
-		1:
-			e.vel = e.vel.lerp(Vector2.ZERO, 1.0 - exp(-5.0 * dt))
-			e.cd -= dt
-			if e.cd <= 0.0:
-				e.state = 2
-				e.cd = 0.9
-				e.vel = dir * spd * 2.6
-				for i in 16:
-					var b := Bullet.new()
-					b.pos = e.pos
-					b.vel = Vector2.from_angle(TAU * i / 16.0 + e.rot) * R * 5.0
-					b.life = 3.0
-					b.r = R * 0.15
-					b.col = Color(1.0, 0.3, 0.5)
-					b.hostile = true
-					b.power = 1.0
-					bullets.append(b)
-		2:
-			e.cd -= dt
-			if e.cd <= 0.0:
-				e.state = 0
+	var rel := e.r / R
+	var spd := 2.3 * e.r
+	var hd := _view_half_diag()
+	var want := Vector2.ZERO
+	var flee := Vector2.ZERO
+	for a in apexes:
+		if not a.dead and a.r > e.r * 0.42 and a.pos.distance_to(e.pos) < a.r * 3.5 + e.r * 6.0:
+			flee += (e.pos - a.pos).normalized()
+	if core != null and not core.gone and core.r < e.r * 0.5:
+		want = (core.pos - e.pos).normalized() * spd * 1.2
+	elif flee != Vector2.ZERO:
+		want = flee.normalized() * spd
+	elif rel > 1.2 and d < hd * 1.2:
+		want = dir * spd
+		if e.cd <= 0.0 and d - e.r - R < e.r * 3.0:
+			# lunge and spit a ring of globs
+			e.cd = 2.4
+			e.st = 0.35
+			e.vel = dir * spd * 3.2
+			for i in 10:
+				var b := Bullet.new()
+				b.pos = e.pos
+				b.vel = Vector2.from_angle(TAU * i / 10.0 + e.rot) * R * 4.5
+				b.life = 2.5
+				b.r = R * 0.12
+				b.col = Color(1.0, 0.3, 0.45)
+				b.hostile = true
+				b.power = 0.8 * rel
+				b.src = "rival"
+				bullets.append(b)
+	elif rel < 0.8 and d < R * 7.0 + e.r:
+		want = -dir * spd
+	else:
+		e.retarget -= dt
+		if e.retarget <= 0.0 or e.target == null or not _rival_can_eat(e, e.target):
+			e.retarget = 0.4
+			e.target = null
+			var bs := 0.0
+			for list in [props, enemies]:
+				for th: Thing in list:
+					if not _rival_can_eat(e, th) or th.pos.distance_to(ppos) > hd * 1.6:
+						continue
+					var dd := th.pos.distance_to(e.pos) / e.r
+					if dd > 14.0:
+						continue
+					var sc := pow(th.r / e.r, 2.0) / pow(dd + 2.0, 1.6)
+					if sc > bs:
+						bs = sc
+						e.target = th
+		if e.target != null:
+			var tdir := (e.target.pos - e.pos).normalized()
+			want = tdir * spd
+			if e.cd <= 0.0 and e.pos.distance_to(e.target.pos) < e.r * 3.5:
+				e.cd = 1.1
+				e.st = 0.25
+				e.vel = tdir * spd * 2.6
+		else:
+			want = dir * spd * 0.5
+	if d > hd * 1.6 and not (core != null and not core.gone and core.r < e.r * 0.5):
+		want = dir * spd
+	e.cd -= dt
+	if e.st <= 0.0:
+		e.vel = e.vel.lerp(want, 1.0 - exp(-3.0 * dt))
 	e.pos += e.vel * dt
 	_rival_feed(e, dt)
 
 
 func _rival_can_eat(e: Thing, th: Thing) -> bool:
+	if th == core:
+		return not th.gone and th.r < e.r * 0.5
 	if th.gone or th.dead or th == e or th.carried or th.grabbed or th.fixed and th.r >= ABSORB * R:
 		return false
 	if th.enemy:
@@ -2114,11 +2228,13 @@ func _rival_feed(e: Thing, dt: float) -> void:
 			tg.vel *= 0.5
 		f["tip"] = tg.pos
 		if d < e.r + tg.r * 0.3:
-			# meals regenerate it back toward its arrival size, never beyond
-			var before := e.hp
-			e.hp = minf(e.max_hp, e.hp + tg.r * tg.r * (0.9 if tg.enemy else 0.5))
-			if e.hp > before + e.max_hp * 0.002:
-				fx_rings.append({"pos": e.pos, "r": e.r * 1.1, "col": Color(1.0, 0.3, 0.35, 0.5), "t": 0.25, "tm": 0.25})
+			if tg == core:
+				core.gone = true
+				_lose("the rival consumed the planet core")
+				return
+			# it grows exactly like you do: same growth curve, same pacing
+			e.hp += GROWTH * tg.r * tg.r * _rival_eff(e)
+			e.max_hp = maxf(e.max_hp, e.hp)
 			if tg.enemy:
 				tg.dead = true
 			tg.gone = true
@@ -2217,14 +2333,27 @@ func _player_collisions() -> void:
 			continue
 		var n := to / maxf(d, 0.000001)
 		if e == boss:
-			if e.r < R * 0.8:
-				_eat_boss()
+			var rel := e.r / R
+			if rel < 0.8:
+				_eat_rival()
+				continue
+			if R < e.r * ABSORB_LIVE:
+				_lose("the rival ate you")
 				return
 			if e.contact_cd <= 0.0:
-				e.contact_cd = 1.2
-				player_hit(2.5 * e.r / R, e.pos)
-				pvel += n * R * 9.0
-				_boss_hurt(10.0 * R * R)
+				e.contact_cd = 1.0
+				stats["rival_strikes"] += 1
+				if rel <= 1.2:
+					# evenly matched: a ram costs both of you
+					player_hit(1.5, e.pos, "rival")
+					_boss_hurt(14.0 * R * R)
+					e.vel -= n * R * 6.0
+				else:
+					player_hit(1.6 * rel, e.pos, "rival")
+				pvel += n * R * 7.0
+			var ov := R + e.r - d
+			ppos += n * ov * 0.5
+			e.pos -= n * ov * 0.5
 			continue
 		if e.r < ABSORB_LIVE * R and not e.grabbed:
 			absorb(e)
@@ -2253,17 +2382,6 @@ func _player_collisions() -> void:
 		var share := 0.9 if e.apex else 0.4
 		ppos += n * overlap * share
 		e.pos -= n * overlap * (1.0 - share)
-
-
-func _eat_boss() -> void:
-	victory = true
-	boss.dead = true
-	core_area += boss.hp
-	recompute_size()
-	ring(ppos, R * 10.0, Color(1, 0.9, 0.5), 1.2)
-	shake = 1.5
-	print("VICTORY at T=%.1f (boss fight %.1fs)" % [t, t - run_len])
-	banner("CRITICAL MASS ACHIEVED", "you ate the rival singularity · %s across" % fmt_len(R * 2.0))
 
 
 func _nearest_def(arr: Array, s: float) -> Dictionary:
@@ -2465,8 +2583,6 @@ func _spawning(dt: float) -> void:
 	# local wildlife density around the player
 	var p := clampf(t / run_len, 0.0, 1.0)
 	var target_n := int(36 + 70 * p)
-	if boss != null:
-		target_n = int(target_n * 0.8)
 	var alive := 0
 	for e in enemies:
 		if e.dead or e == boss or e.apex:
@@ -2534,7 +2650,7 @@ func _cleanup() -> void:
 		props = props.filter(func(p): return not p.gone)
 		enemies = enemies.filter(func(e): return not e.dead)
 		apexes = apexes.filter(func(e): return not e.dead)
-	if boss != null and boss.dead and not victory:
+	if boss != null and boss.dead:
 		boss = null
 
 
@@ -2635,7 +2751,7 @@ func _print_log() -> void:
 	print("T=%5.1f D=%s zone=%d%s surf=%d integ=%.2f imb=%.2f en=%d props=%d ranks=%s %s%s%s" % [
 		t, fmt_len(R * 2.0), zone, "(open)" if zone_open else "", surface_count(), integrity, imbalance,
 		alive, props.size(), " ".join(rk), str(stats), ap,
-		(" BOSS r=%.3f" % boss.r) if boss != null else ""])
+		(" RIVAL r/R=%.2f dist/hd=%.2f" % [boss.r / R, boss.pos.distance_to(ppos) / _view_half_diag()]) if boss != null else " RIVAL reforming"])
 
 
 # =============================================================================
@@ -2789,8 +2905,13 @@ func _draw_patches() -> void:
 
 func _draw_props() -> void:
 	for p in props:
-		if p.gone or not _on_screen(p.pos, p.r):
+		if p.gone or not _on_screen(p.pos, p.r * 1.6):
 			continue
+		if p == core:
+			var cc := w2s(p.pos)
+			var pulse := 0.5 + 0.5 * sin(t * 2.0)
+			draw_circle(cc, p.r * zoom * (1.35 + 0.05 * pulse), Color(1.0, 0.45, 0.1, 0.12))
+			draw_circle(cc, p.r * zoom * 1.15, Color(1.0, 0.55, 0.15, 0.18))
 		var c := w2s(p.pos)
 		var sr := p.r * zoom
 		var fill: Color = p.d["col"]
@@ -3167,7 +3288,10 @@ func _hud_text(p: Vector2, s: String, fs: int, col: Color) -> void:
 func _draw_hud() -> void:
 	var remain := maxf(0.0, run_len - t)
 	_hud_text(Vector2(16, 30), "%02d:%02d" % [int(t) / 60, int(t) % 60], 26, Color(1, 1, 1))
-	_hud_text(Vector2(100, 30), "/ %02d:%02d" % [int(run_len) / 60, int(run_len) % 60] if remain > 0 else "RIVAL ARRIVED", 16, Color(0.7, 0.7, 0.8))
+	var gf := clampf(log(R / R0) / log(TARGET_R / R0), 0.0, 1.0)
+	_hud_text(Vector2(100, 30), "GOAL: eat the planet core at %s" % fmt_len(TARGET_R * 2.0), 14, Color(1.0, 0.7, 0.4))
+	draw_rect(Rect2(100, 36, 200, 5), Color(0.2, 0.2, 0.25))
+	draw_rect(Rect2(100, 36, 200 * gf, 5), Color(1.0, 0.6, 0.25))
 	_hud_text(Vector2(16, 62), fmt_len(R * 2.0), 30, Color(0.9, 0.8, 1.0))
 	var zl := "ZONE %d · %s" % [zone + 1, zone_def.get("name", "")]
 	if wall_r > 0.0:
@@ -3199,14 +3323,19 @@ func _draw_hud() -> void:
 	_hud_text(Vector2(120, 172), bc, 12, Color(0.85, 0.7, 1.0) if burst_cd <= 0.0 else Color(0.5, 0.5, 0.55))
 	_draw_tree_panel()
 	_draw_apex_markers()
+	var bw := 420.0
+	var bx := (screen.x - bw) * 0.5
 	if boss != null and not boss.dead:
-		var bw := 500.0
-		var bx := (screen.x - bw) * 0.5
 		var ratio := boss.r / R
-		_hud_text(Vector2(bx, screen.y - 58), "RIVAL SINGULARITY  %s  (%.2fx your size — eat it below 0.80x)" % [fmt_len(boss.r * 2.0), ratio], 14, Color(1, 0.5, 0.6))
-		draw_rect(Rect2(bx, screen.y - 48, bw, 10), Color(0.2, 0.1, 0.12))
-		draw_rect(Rect2(bx, screen.y - 48, bw * clampf(ratio / 2.0, 0, 1), 10), Color(1, 0.3, 0.45))
-		draw_line(Vector2(bx + bw * 0.4, screen.y - 52), Vector2(bx + bw * 0.4, screen.y - 34), Color(0.5, 1, 0.6), 2.0)
+		var band := "you can EAT it" if ratio < 0.8 else ("EVEN: rams hurt you both" if ratio <= 1.2 else "BIGGER: it hunts you")
+		var bcol := Color(0.55, 1.0, 0.65) if ratio < 0.8 else (Color(1.0, 0.85, 0.4) if ratio <= 1.2 else Color(1.0, 0.35, 0.4))
+		_hud_text(Vector2(bx, screen.y - 40), "RIVAL OOZE  %.2fx your size — %s" % [ratio, band], 14, bcol)
+		draw_rect(Rect2(bx, screen.y - 32, bw, 8), Color(0.2, 0.1, 0.12))
+		draw_rect(Rect2(bx, screen.y - 32, bw * clampf(ratio / 2.0, 0, 1), 8), bcol)
+		draw_line(Vector2(bx + bw * 0.4, screen.y - 35), Vector2(bx + bw * 0.4, screen.y - 21), Color(0.5, 1, 0.6), 2.0)
+		draw_line(Vector2(bx + bw * 0.6, screen.y - 35), Vector2(bx + bw * 0.6, screen.y - 21), Color(1, 0.4, 0.4), 2.0)
+	else:
+		_hud_text(Vector2(bx, screen.y - 40), "RIVAL OOZE reforming in %ds" % int(maxf(rival_reform, 0.0)), 14, Color(0.7, 0.6, 0.65))
 	var by := screen.y * 0.22
 	for b in banners:
 		var a := clampf(b["t"] / 0.5, 0.0, 1.0) * clampf((3.5 - b["t"]) / 0.15, 0.0, 1.0)
@@ -3267,7 +3396,12 @@ func _draw_tree_panel() -> void:
 
 
 func _draw_apex_markers() -> void:
-	for e in apexes:
+	var marks: Array = apexes.duplicate()
+	if boss != null and not boss.dead:
+		marks.append(boss)
+	if core != null and not core.gone:
+		marks.append(core)
+	for e: Thing in marks:
 		if e.dead:
 			continue
 		var s := w2s(e.pos)
@@ -3281,10 +3415,14 @@ func _draw_apex_markers() -> void:
 		var p := ctr + dir * k
 		var edible := e.r < ABSORB_LIVE * R
 		var col := Color(0.55, 1.0, 0.65) if edible else Color(1.0, 0.3, 0.2, 0.6 + 0.4 * sin(t * (10.0 if e.state == 1 else 3.0)))
+		if e == boss:
+			col = Color(0.55, 1.0, 0.65) if e.r < R * 0.8 else Color(1.0, 0.45, 0.55)
+		elif e == core:
+			col = Color(1.0, 0.65, 0.25) if e.r >= ABSORB * R else Color(0.55, 1.0, 0.65)
 		var side := dir.orthogonal() * 9.0
 		draw_colored_polygon(PackedVector2Array([p + dir * 14.0, p - dir * 4.0 + side, p - dir * 4.0 - side]), col)
 		var lbl := "%s %s" % [String(e.d["lbl"]), fmt_len(e.pos.distance_to(ppos))]
-		if e.state == 1:
+		if e.apex and e.state == 1:
 			lbl = "HUNTING · " + lbl
 		var w := font.get_string_size(lbl, HORIZONTAL_ALIGNMENT_LEFT, -1, 12).x
 		var lp := p - dir * 22.0 - Vector2(w * 0.5, -4)
