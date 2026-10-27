@@ -31,10 +31,10 @@ func _diet_weight(d: Dictionary) -> float:
 func think(g, dt: float) -> Dictionary:
 	t += dt
 	retarget -= dt
-	var R: float = g.R
-	var pos: Vector2 = g.ppos
+	var R: float = g.me.R
+	var pos: Vector2 = g.me.ppos
 	var out := {"move": Vector2.ZERO, "burst": false, "spin": 0.0, "lurch": false}
-	if g.game_over or g.victory:
+	if g.me.game_over or g.me.victory:
 		return out
 
 	if target != null and (target.gone or target.dead):
@@ -98,7 +98,7 @@ func think(g, dt: float) -> Dictionary:
 			continue
 		var harm: float = 1.6 if (td.has("drain") or td.has("corrode")) else (0.5 if float(td.get("slow", 1.0)) < 0.6 else 0.15)
 		avoid += to / maxf(d, 0.0001) * harm * k / maxf(gap + 0.6, 0.25)
-	for s in g.strikes:
+	for s in g.me.strikes:
 		var to: Vector2 = pos - s["pos"]
 		if to.length() < s["r"] + R * 1.5:
 			avoid += to.normalized() * 4.0
@@ -161,7 +161,7 @@ func think(g, dt: float) -> Dictionary:
 	if threats >= 4:
 		out["burst"] = true
 	# lurch at the current target once it's within reach, or lurch to flee a hunting apex
-	if g.lurch_state == 0 and g.lurch_cd <= 0.0:
+	if g.me.lurch_state == 0 and g.me.lurch_cd <= 0.0:
 		if target != null and not target.gone and pos.distance_to(target.pos) - target.r - R < g.lurch_range() and avoid.length() < 1.5:
 			out["lurch"] = true
 		for e in g.apexes:
@@ -171,8 +171,8 @@ func think(g, dt: float) -> Dictionary:
 
 
 func _pick_target(g):
-	var R: float = g.R
-	var pos: Vector2 = g.ppos
+	var R: float = g.me.R
+	var pos: Vector2 = g.me.ppos
 	var best = null
 	var bs := 0.0
 	for p in g.props:
