@@ -15,6 +15,23 @@ No art yet: shapes, labels and colors only. The point is to test the mechanics.
 
 `run.sh` uses the local Godot binary in `.tools/godot` (gitignored), or `godot` on your PATH if that's missing.
 
+## Online play
+
+Players race each other to the planet core in the same world. One player hosts and runs the simulation; everyone else joins by address.
+
+```
+./run.sh --host --players=3              # host a 3-player match on UDP port 7777; ENTER starts early
+./run.sh --join=192.168.1.20 --name=ana  # join it (add :PORT if the host used --port=N)
+./run.sh --players=3                     # offline: you against two autopiloted oozes
+```
+
+- **Lobby.** The host's clock waits until every slot is taken, or until the host presses ENTER. The autopilot plays any empty slot, and takes over if a player disconnects.
+- **Player vs player.** Other players use the same size bands as rivals. Under 0.8× your size you can eat them, between 0.8× and 1.25× a ram knocks pieces off both of you, and above that they can eat you. Your abilities chip their hull too.
+- **Nobody is knocked out.** If you're eaten or your core gives out, you reform 30 s later at a little under the smallest ooze still in play, as far as possible from anything that could eat you, inside a shimmering shell that can't be swallowed for 5 s. Your essence tree survives, but your hull doesn't. The first ooze to swallow the planet core wins the match.
+- **Forks don't pause.** In a shared world the fork cards sit low on the screen while you keep playing. Press 1–3 when you're ready.
+- AI rivals are off by default in multiplayer. Add them with `--rivals=N`.
+- Internet play needs UDP 7777 forwarded to the host. There's no client-side prediction yet, so it's built for LAN and low-latency links. Snapshots are 4–10 KB at 20 Hz per client.
+
 ## The player: a black ooze
 
 You're a slime mold, not a ball:
@@ -44,7 +61,7 @@ Each zone has its own floor (terracotta tile, teal carpet, grass, asphalt, concr
 | Apex predators | One roaming miniboss per zone: Rat King, Roomba Prime, Junkyard Hound, SWAT Command, Warden Mech, Kaiju Matriarch, Elder Titan. Each is about 3× your size when you arrive. It patrols the zone and shows a faint sight ring. When it spots you it flashes "!", hunts at 95% of your speed, fires red volleys, and crouches before a pounce. **It's deadly.** Contact tears straight into your core: you lose a core integrity point no matter how much armor you have, plus a chunk of hull. After each strike it backs off for a few seconds, which is your window to break line of sight. Three strikes before your core regenerates and you're dead. An edge-of-screen arrow tracks it. Late in the zone you can kill it, which floods your branches with essence and drops loot. Outgrow it and it runs from you, and you can eat it. The rival avoids apexes too. |
 | Local wildlife | Nothing crosses the map to hunt you. Creatures wander around a home point. Prey (anything you can eat) flees at a speed you can run down. Predators bigger than you chase only inside a leash around their home, ranged ones hold position and shoot, and rammers telegraph a charge. Elites have a gold ring. Orbital strikes with reticles start in Downtown. |
 | Rival oozes | Rivals spawn next to you at the start and play the same game. They forage for the same food near you, grow on the same pacing curve with no ceiling, flee apexes and bigger rivals, and follow you out through each zone wall. Each rival hunts whichever ooze nearby is meaningfully smaller, you or another rival. Contact depends on relative size. Under 0.8× your size, you eat it. Between 0.8× and 1.2×, a ram knocks pieces off both of you. Above 1.2×, it hunts you, lunges, and spits rings of globs. Big enough and it eats you. Rivals use the same bands with each other. Anything eaten reforms 45 s later at your size. |
-| Modes | A mode screen before the starting essence: **Duel** (one rival), **Free-for-all** (three rivals that also eat each other), **Solo** (no rivals). `--rivals=N` skips the screen. |
+| Modes | A mode screen before the starting essence: **Duel** (one rival), **Free-for-all** (three rivals that also eat each other), **Solo** (no rivals). `--rivals=N` skips the screen. **Multiplayer** (`--players=N`, up to 4) puts other oozes in the same world: online players, or the autopilot offline. See "Online play" above. |
 | The goal | In the open world, the planet core sits at the center of the map. It's the one thing you can eat at your own size: a molten sphere nearly as big as the target, edible once you reach 2.8 km across. Eat it first and you win. If the rival eats it first, you lose. The HUD shows a goal progress bar and the rival's size relative to yours. Edge arrows track the rival and the core. |
 
 ## Tuning notes from simulated playtests
@@ -97,9 +114,19 @@ Eighth round (uncapped rivals, lethality, modes):
 
 Still open: the autopilot dodges well. Two of five autopilot runs since the rival was added died to the Rat King in the kitchen (1:31 and 1:51). It's unclear whether the rival competing for kitchen food makes the opening harsher or those are just hard seeds. Apexes ignore the rival, so it forages freely while you hide. The README's "about 3 km @ 20:00" pacing note predates the core: runs now end at the core around 18–19 minutes. Also and almost never has its core breached outside the rival fight, so difficulty for a real player is unknown. The bot picks forks at random, so it doesn't test build strategy. Every enemy at the 2 km+ range is a "serpent" or "leviathan" because the roster runs out.
 
+Ninth round (multiplayer):
+
+- **One world, many sizes.** The world used to assume a single viewer: anything beneath your notice or off your screen was deleted. With oozes of different sizes in one world, that would delete the smaller player's food. Now a thing is only culled once it's beneath the notice of, and far from, every ooze. Wildlife and apexes react to whichever ooze is nearest. Each zone is built once, by the first ooze to reach it, and stragglers walk into the existing one.
+- **Refactor check.** Moving player state into an `Ooze` object and making every random call seeded left single-player unchanged: seeded 300 s autopilot runs (duel and free-for-all) log byte-identical output before and after.
+- **Online.** A headless host plus two headless clients (whose autopilots play from the streamed state alone) ran a full 3-player match over localhost. One client left at 5:00 and the autopilot took over its ooze. The host's ooze swallowed the core at 18:15, and the remaining client got the defeat screen. The client autopilot got eaten much more often than the host's (23 times), because it reformed right next to the ooze that ate it. Reforming away from bigger oozes, with a 5 s guard, halved early repeat-eating.
+- **3-player autopilot matches** (offline, 3 seeds). Players stayed within about 1.5× of each other, ate each other 13–24 times in the first 10 minutes, and each match ended with someone swallowing the core at 18:18–18:36. Winners differed between seeds (P3, P3, P2).
+
+Still open in multiplayer: whoever falls behind gets eaten a lot. In autopilot matches each ooze is eaten about once every 2–3 minutes, mostly the smallest by the largest, and it spends 30 s reforming each time. Real players may hunt less relentlessly than the autopilot, so this needs human playtests before tuning. Players in the same area also share one food budget, which squeezes whoever's on the edge. Online there's no client-side prediction, so your own ooze responds one round trip late.
+
 ## Layout
 
 - `scripts/game.gd`: the whole simulation and renderer. It draws manually in screen space, so a single scene spans 4+ orders of magnitude.
 - `scripts/defs.gd`: props, enemies, synergies, themes, zones and the essence tree. All tunable data lives here.
-- `scripts/bot.gd`: the autopilot used for simulated playtests.
+- `scripts/bot.gd`: the autopilot used for simulated playtests. It also plays empty multiplayer slots, and online clients can run it on the replicated state (`--join=... --bot`).
+- `scripts/net.gd`: online play. Snapshot encoding (filtered to what each player can see) and client-side decoding and smoothing.
 - `screenshots/`: frames from simulated runs.

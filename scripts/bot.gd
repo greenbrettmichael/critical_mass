@@ -114,8 +114,8 @@ func think(g, dt: float) -> Dictionary:
 			threats += 2
 			avoid += to / maxf(d, 0.0001) * 5.0 * (sight * 1.3 - d) / sight
 
-	# the rival ooze: hunt it when it's smaller, give it room when even, flee when bigger
-	for boss in g.rivals:
+	# rival oozes and other players: hunt them smaller, give them room even, flee them bigger
+	for boss in g.rivals + g.other_avatars():
 		if boss.dead:
 			continue
 		var to: Vector2 = boss.pos - pos

@@ -79,6 +79,12 @@ class Thing:
 	var accent := Color(1.0, 0.45, 0.5)
 	var tag_name := "RIVAL"
 	var retarget := 0.0
+	var oz = null           # set on the stand-in for another player's ooze (an Ooze)
+	var shed_by = null      # the ooze a loose hull piece came off
+	var nid := 0            # network id (host assigns on first send)
+	var did := -1           # network def id
+	var net_to := Vector2.INF   # client: where the last snapshot put it
+	var seen := false
 
 class HullItem:
 	var d: Dictionary
@@ -89,6 +95,7 @@ class HullItem:
 	var surface := true
 	var creature := false
 	var wob := 0.0
+	var did := -1
 
 class Bullet:
 	var pos := Vector2.ZERO
@@ -104,6 +111,7 @@ class Bullet:
 	var turn := 0.0
 	var hit := {}
 	var src := ""
+	var oz = null           # the ooze that fired it (player shots)
 
 class Ooze:
 	## One player-shaped ooze: body, hull, essence tree, camera. Everything the
@@ -182,11 +190,49 @@ class Ooze:
 	var floor_col := Color(0.66, 0.47, 0.38)
 	var choice_wait := 0
 	var bot: Bot = null
+	# who this is, and multiplayer bookkeeping
+	var id := 0
+	var name := "YOU"
+	var skin := Color(0.045, 0.035, 0.06)
+	var cell := Color(0.32, 0.22, 0.42, 0.9)
+	var accent := Color(0.75, 0.45, 1.0)
+	var peer := 1               # network peer that steers it
+	var avatar: Thing = null    # its stand-in among the enemies, so others can hit and eat it
+	var inbox := []             # hits other oozes dealt it this frame: {"power", "src"}
+	var hit_acc := 0.0
+	var down := false           # eaten or collapsed: reforming
+	var respawn_t := 0.0
+	var guard := 0.0            # can't be eaten for a few seconds after reforming
+	var killer := ""
+	var pick_serial := 0        # forks answered so far (stale picks from the network are ignored)
+	var net_items := -1         # client: hull piece count (only the visible ones are sent)
+	var net_to := Vector2.INF
 
 
 var rng := RandomNumberGenerator.new()
-var me: Ooze = Ooze.new()          # the ooze being simulated / viewed right now
+var me: Ooze = Ooze.new()          # the ooze being simulated right now
+var view: Ooze = me                # the ooze this screen follows
 var oozes: Array[Ooze] = []
+var players := 1                   # oozes steered by players (extra ones are autopiloted offline)
+var match_over := false
+var zones_built := 0
+# online: one player hosts the simulation, the rest join and stream snapshots
+var net: Net = null
+var net_mode := ""                 # "", "host" or "client"
+var net_addr := "127.0.0.1"
+var net_port := Net.PORT
+var net_name := ""
+var net_status := ""
+var lobby := false                 # host: waiting for players before the clock starts
+var snap_bytes := 0
+var watch := -1                    # debug: follow another ooze's camera in an offline match
+var next_client_log := 0.0
+const PLAYER_LOOKS := [
+	{"name": "P1", "skin": Color(0.045, 0.035, 0.06), "cell": Color(0.32, 0.22, 0.42, 0.9), "accent": Color(0.75, 0.45, 1.0)},
+	{"name": "P2", "skin": Color(0.02, 0.045, 0.06), "cell": Color(0.18, 0.42, 0.5, 0.9), "accent": Color(0.35, 0.9, 1.0)},
+	{"name": "P3", "skin": Color(0.06, 0.045, 0.015), "cell": Color(0.5, 0.4, 0.15, 0.9), "accent": Color(1.0, 0.8, 0.3)},
+	{"name": "P4", "skin": Color(0.025, 0.055, 0.03), "cell": Color(0.22, 0.48, 0.24, 0.9), "accent": Color(0.5, 1.0, 0.5)},
+]
 var run_len := 20.0 * 60.0
 var t := 0.0
 var bot_mode := false
@@ -278,6 +324,18 @@ func _ready() -> void:
 			"apex_test": apex_test = true
 			"rivals": rival_count = int(v)
 			"idle": idle_test = true
+			"players": players = clampi(int(v), 1, PLAYER_LOOKS.size())
+			"host": net_mode = "host"
+			"watch": watch = int(v)
+			"port": net_port = int(v)
+			"name": net_name = v
+			"join":
+				net_mode = "client"
+				var hp := v.split(":")
+				if hp[0] != "":
+					net_addr = hp[0]
+				if hp.size() > 1:
+					net_port = int(hp[1])
 	rng.seed = seed_v
 	if bot_mode:
 		me.bot = Bot.new()
@@ -294,8 +352,309 @@ func _ready() -> void:
 	enemy_sorted = Defs.ENEMIES.duplicate()
 	for b in Defs.TREE:
 		tree_by_tag[b["tag"]] = b
+	if net_mode == "client":
+		_join()
+		return
+	if players > 1:
+		_look(me, 0)
+	_start_ooze(start_r, Vector2.ZERO)
+	# extra players: autopiloted offline, steered by remote peers online
+	for i in range(1, players):
+		var o := Ooze.new()
+		o.id = i
+		_look(o, i)
+		o.bot = Bot.new()
+		o.bot.rng.seed = seed_v + 7919 * i
+		o.peer = 0
+		oozes.append(o)
+		me = o
+		var arena := ARENA_K * float(Defs.ZONES[view.zone]["hi"])
+		_start_ooze(start_r, Vector2.from_angle(TAU * i / players + 0.5) * arena * 0.45)
+		if start_r <= R0 and not apex_test:
+			_queue_start_choice()
+	if players > 1:
+		for o in oozes:
+			_make_avatar(o)
+	if watch > 0 and watch < oozes.size():
+		view = oozes[watch]
+	me = view
+	if apex_test:
+		rival_count = 0
+	elif rival_count < 0 and (bot_mode or players > 1):
+		# with other players in the match, rivals are opt-in
+		rival_count = 1 if players == 1 else 0
+	if rival_count >= 0:
+		_spawn_rivals()
+	else:
+		_queue_mode_choice()
+	if apex_test and not apexes.is_empty():
+		var ax: Thing = apexes[0]
+		ax.pos = me.ppos + Vector2(me.R * 7.0 + ax.r, 0)
+		ax.state = 1
+		ax.st = 999.0
+		me.pending.clear()
+	if start_r <= R0 and not apex_test:
+		_queue_start_choice()
+	if net_mode == "host":
+		_host()
+
+
+# =============================================================================
+# Online play
+# =============================================================================
+
+func _host() -> void:
+	net = Net.new()
+	var peer := ENetMultiplayerPeer.new()
+	var err := peer.create_server(net_port, 8)
+	if err != OK:
+		net_status = "could not host on port %d (%s)" % [net_port, error_string(err)]
+		print("NET " + net_status)
+		net_mode = ""
+		return
+	multiplayer.multiplayer_peer = peer
+	multiplayer.peer_connected.connect(func(id): print("NET peer %d connected" % id))
+	multiplayer.peer_disconnected.connect(_on_peer_left)
+	lobby = players > 1
+	net_status = "hosting on port %d" % net_port
+	print("NET hosting on port %d with %d open slots" % [net_port, players - 1])
+
+
+func _join() -> void:
+	net = Net.new()
+	var peer := ENetMultiplayerPeer.new()
+	var err := peer.create_client(net_addr, net_port)
+	if err != OK:
+		net_status = "could not connect (%s)" % error_string(err)
+		print("NET " + net_status)
+		return
+	multiplayer.multiplayer_peer = peer
+	multiplayer.connected_to_server.connect(func(): _net_hello.rpc_id(1, net_name))
+	multiplayer.connection_failed.connect(func():
+		net_status = "could not reach %s:%d" % [net_addr, net_port]
+		print("NET " + net_status))
+	multiplayer.server_disconnected.connect(func():
+		net_status = "the host left"
+		print("NET " + net_status)
+		if bot_mode:
+			get_tree().quit())
+	net_status = "connecting to %s:%d" % [net_addr, net_port]
+	print("NET " + net_status)
+
+
+func _ooze_of_peer(id: int) -> Ooze:
+	for o in oozes:
+		if o.peer == id and id > 1:
+			return o
+	return null
+
+
+func _start_match() -> void:
+	lobby = false
+	print("EVENT t=%.2f frame=%d START" % [t, frames])
+	var prev := me
+	for o in oozes:
+		me = o
+		banner("GO", "first to swallow the planet core wins")
+	me = prev
+
+
+func _on_peer_left(id: int) -> void:
+	var o := _ooze_of_peer(id)
+	if o == null:
+		return
+	o.peer = 0
+	o.bot = Bot.new()
+	o.bot.rng.seed = rng.randi()
+	print("EVENT t=%.2f frame=%d LEAVE %s peer=%d" % [t, frames, o.name, id])
+	me = view
+	banner("%s LEFT" % o.name, "the autopilot takes over their ooze")
+
+
+func _net_send() -> void:
+	if net == null or frames % Net.SNAP_EVERY != 0:
+		return
+	var out := []
+	for o in oozes:
+		if o.peer > 1:
+			out.append([o.peer, net.encode(self, o)])
+	if not net.new_defs.is_empty():
+		_net_defs.rpc(net.new_defs)
+		net.new_defs = []
+	for pr in out:
+		snap_bytes = (pr[1] as PackedByteArray).size()
+		_net_snap.rpc_id(pr[0], pr[1])
+
+
+func _client_frame(dt: float) -> void:
+	if net == null or not net.got_snap:
+		return
+	me = view
+	net.smooth(self, dt)
+	if view.bot != null:
+		if not view.pending.is_empty():
+			view.choice_wait += 1
+			if view.choice_wait > choice_hold:
+				view.choice_wait = 0
+				_pick(view.bot.pick(self, view.pending[0]["options"]))
+		if not (view.down or view.game_over or view.victory):
+			var b := view.bot.think(self, dt)
+			view.input_move = b["move"]
+			view.want_burst = b["burst"]
+			view.manual_spin = b["spin"]
+			view.want_lurch = b.get("lurch", false)
+	else:
+		_read_input()
+	var flags := (1 if view.want_lurch else 0) | (2 if view.want_burst else 0)
+	_net_input.rpc_id(1, view.input_move, view.manual_spin, flags)
+	_update_camera(dt)
+	_update_floor(dt)
+	_update_world_fx(dt)
+	_update_fx(dt)
+	if t >= next_client_log:
+		next_client_log = t + 10.0
+		print("CLIENT T=%5.1f %s D=%s zone=%d down=%s props=%d en=%d bullets=%d snap=%dB%s" % [
+			t, view.name, fmt_len(view.R * 2.0), view.zone, view.down, props.size(), enemies.size(), bullets.size(),
+			snap_bytes, _ooze_log()])
+	if view.game_over or view.victory:
+		view.end_t += dt
+		if bot_mode and view.end_t > 3.5:
+			print("CLIENT END %s" % ("VICTORY" if view.victory else "DEFEAT"))
+			get_tree().quit()
+	if quit_after > 0 and t >= quit_after:
+		get_tree().quit()
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _net_hello(nm: String) -> void:
+	if net_mode != "host":
+		return
+	var id := multiplayer.get_remote_sender_id()
+	for o in oozes:
+		if o == view or o.peer != 0:
+			continue
+		o.peer = id
+		o.bot = null
+		o.input_move = Vector2.ZERO
+		o.want_lurch = false
+		o.want_burst = false
+		if nm != "":
+			o.name = nm.left(12).to_upper()
+			if o.avatar != null:
+				o.avatar.tag_name = o.name
+				o.avatar.d["lbl"] = o.name
+		print("EVENT t=%.2f frame=%d JOIN %s peer=%d" % [t, frames, o.name, id])
+		var names := []
+		for x in oozes:
+			names.append(x.name)
+		_net_welcome.rpc_id(id, o.id, names, net.defs)
+		me = view
+		banner("%s JOINED" % o.name, "%s takes over from the autopilot" % o.name)
+		if lobby:
+			var open := 0
+			for x in oozes:
+				if x != view and x.peer == 0:
+					open += 1
+			if open == 0:
+				_start_match()
+		return
+	print("NET match full, turning away peer %d" % id)
+	multiplayer.multiplayer_peer.disconnect_peer(id)
+
+
+@rpc("any_peer", "call_remote", "unreliable_ordered")
+func _net_input(mv: Vector2, spin: float, flags: int) -> void:
+	var o := _ooze_of_peer(multiplayer.get_remote_sender_id())
+	if o == null:
+		return
+	o.input_move = mv.limit_length(1.0)
+	o.manual_spin = clampf(spin, -1.0, 1.0)
+	o.want_lurch = (flags & 1) != 0
+	o.want_burst = (flags & 2) != 0
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _net_click(p: Vector2) -> void:
+	var o := _ooze_of_peer(multiplayer.get_remote_sender_id())
+	if o != null:
+		o.click_world = p
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _net_pick(serial: int, i: int) -> void:
+	var o := _ooze_of_peer(multiplayer.get_remote_sender_id())
+	if o == null or o.pending.is_empty() or serial != o.pick_serial:
+		return
+	me = o
+	_choose(i)
+	me = view
+
+
+@rpc("authority", "call_remote", "reliable")
+func _net_welcome(slot: int, names: Array, defs: Array) -> void:
+	oozes.clear()
+	for i in names.size():
+		var o := Ooze.new()
+		o.id = i
+		_look(o, i)
+		o.name = names[i]
+		oozes.append(o)
+	view = oozes[slot]
+	me = view
+	for o in oozes:
+		if o != view:
+			_make_avatar(o)
+	for i in defs.size():
+		net.cdefs[i] = defs[i]
+	if bot_mode:
+		view.bot = Bot.new()
+		view.bot.rng.seed = rng.randi()
+	net_status = "joined as %s" % view.name
+	print("NET joined as slot %d (%s) of %d" % [slot, view.name, names.size()])
+
+
+@rpc("authority", "call_remote", "reliable")
+func _net_defs(arr: Array) -> void:
+	for pair in arr:
+		net.cdefs[pair[0]] = pair[1]
+
+
+@rpc("authority", "call_remote", "unreliable_ordered")
+func _net_snap(bytes: PackedByteArray) -> void:
+	if net == null or view == null:
+		return
+	snap_bytes = bytes.size()
+	net.apply(self, bytes)
+
+
+func make_thing() -> Thing:
+	return Thing.new()
+
+
+func make_item() -> HullItem:
+	return HullItem.new()
+
+
+func make_bullet() -> Bullet:
+	return Bullet.new()
+
+
+func dress_rival(e: Thing, slot: int) -> void:
+	# client side: give a rival ooze its colours and hull junk
+	e.slot = slot
+	var look: Dictionary = RIVAL_LOOKS[slot % RIVAL_LOOKS.size()]
+	e.tint = look["tint"]
+	e.accent = look["accent"]
+	e.tag_name = look["name"] if rival_count > 1 else "RIVAL"
+	for i in 14:
+		e.parts.append({"a": rng.randf() * TAU, "s": rng.randf_range(0.12, 0.3), "c": Color.from_hsv(rng.randf(), 0.5, 0.7), "sh": rng.randi() % 5})
+
+
+func _start_ooze(start_r: float, at: Vector2) -> void:
+	for b in Defs.TREE:
 		me.essence[b["tag"]] = 0.0
 		me.ranks[b["tag"]] = 0
+	me.ppos = at
 	if start_r > R0:
 		_seed_hull(start_r)
 	recompute_size()
@@ -313,22 +672,83 @@ func _ready() -> void:
 	for i in 10:
 		spawn_enemy()
 	me.syn_seen = me.syn_active.duplicate()
-	if apex_test:
-		rival_count = 0
-	elif rival_count < 0 and bot_mode:
-		rival_count = 1
-	if rival_count >= 0:
-		_spawn_rivals()
-	else:
-		_queue_mode_choice()
-	if apex_test and not apexes.is_empty():
-		var ax: Thing = apexes[0]
-		ax.pos = me.ppos + Vector2(me.R * 7.0 + ax.r, 0)
-		ax.state = 1
-		ax.st = 999.0
-		me.pending.clear()
-	if start_r <= R0 and not apex_test:
-		_queue_start_choice()
+
+
+func _look(o: Ooze, i: int) -> void:
+	var lk: Dictionary = PLAYER_LOOKS[i % PLAYER_LOOKS.size()]
+	o.name = lk["name"]
+	o.skin = lk["skin"]
+	o.cell = lk["cell"]
+	o.accent = lk["accent"]
+
+
+func _make_avatar(o: Ooze) -> void:
+	# other oozes see this one as a big live thing: abilities hit it, bigger oozes eat it
+	var a := Thing.new()
+	a.d = Defs.BOSS.duplicate()
+	a.d["lbl"] = o.name
+	a.enemy = true
+	a.rival = true
+	a.oz = o
+	a.tag_name = o.name
+	a.tint = o.skin
+	a.accent = o.accent
+	a.age = 10.0
+	o.avatar = a
+	_sync_avatar(o, 0.0)
+	enemies.append(a)
+
+
+func _sync_avatar(o: Ooze, dt: float) -> void:
+	var a := o.avatar
+	if a == null:
+		return
+	a.pos = o.ppos
+	a.vel = o.pvel
+	a.r = o.R
+	a.hp = o.R * o.R
+	a.max_hp = a.hp
+	a.dead = o.down
+	a.contact_cd -= dt
+	a.flash -= dt
+
+
+func multi() -> bool:
+	return oozes.size() > 1
+
+
+func live_oozes() -> Array[Ooze]:
+	var out: Array[Ooze] = []
+	for o in oozes:
+		if not o.down:
+			out.append(o)
+	return out
+
+
+func other_avatars() -> Array:
+	# the other players' stand-ins, as seen by `me` (the bot reads this)
+	var out := []
+	for o in oozes:
+		if o != me and not o.down and o.avatar != null:
+			out.append(o.avatar)
+	return out
+
+
+func _nearest_ooze(p: Vector2) -> Ooze:
+	var best: Ooze = view
+	var bd := INF
+	for o in oozes:
+		if o.down:
+			continue
+		var d := o.ppos.distance_squared_to(p)
+		if d < bd:
+			bd = d
+			best = o
+	return best
+
+
+func _ended() -> bool:
+	return match_over if multi() else (view.game_over or view.victory)
 
 
 func _seed_hull(target_r: float) -> void:
@@ -377,7 +797,17 @@ func _build_polys() -> void:
 func _physics_process(dt: float) -> void:
 	frames += 1
 	screen = get_viewport_rect().size
-	if not me.pending.is_empty():
+	if net_mode == "client":
+		_client_frame(dt)
+		return
+	me = view
+	if lobby:
+		_net_send()
+		return
+	if multi():
+		# nobody can pause a shared world: forks wait on screen while you play
+		_multi_choices()
+	elif not me.pending.is_empty():
 		# the game pauses while a tree fork is on screen
 		if apex_test or idle_test:
 			_choose(0)
@@ -393,37 +823,60 @@ func _physics_process(dt: float) -> void:
 				me.choice_wait = 0
 				_choose(me.bot.pick(self, me.pending[0]["options"]))
 		return
-	if not (me.game_over or me.victory):
+	if not _ended():
 		t += dt
-	_read_input()
-	if me.bot != null:
-		var b := me.bot.think(self, dt)
-		me.input_move = b["move"]
-		me.want_burst = b["burst"]
-		me.manual_spin = b["spin"]
-		me.want_lurch = b.get("lurch", false)
+	for o in oozes:
+		me = o
+		if o == view:
+			_read_input()
+		if o.bot != null and not o.down:
+			var b := o.bot.think(self, dt)
+			o.input_move = b["move"]
+			o.want_burst = b["burst"]
+			o.manual_spin = b["spin"]
+			o.want_lurch = b.get("lurch", false)
 
 	_build_grid()
-	if not (me.game_over or me.victory):
-		_update_player(dt)
-		_update_abilities(dt)
-		_update_synergies(dt)
+	for o in live_oozes():
+		me = o
+		_take_inbox()
+		if not (me.game_over or me.victory) and not me.down:
+			_update_player(dt)
+			_update_abilities(dt)
+			_update_synergies(dt)
+		_sync_avatar(o, dt)
+	me = view
 	_update_enemies(dt)
 	_update_bullets(dt)
 	_update_props(dt)
-	_process_bursts()
-	if not (me.game_over or me.victory):
-		_player_collisions()
-		_spawning(dt)
-		_update_strikes(dt)
-		_check_collapse()
-		_check_zone()
+	for o in live_oozes():
+		me = o
+		_process_bursts()
+	for o in live_oozes():
+		me = o
+		if not (me.game_over or me.victory):
+			_player_collisions()
+			if me.down:
+				continue
+			_spawning(dt)
+			_update_strikes(dt)
+			_check_collapse()
+			_check_zone()
+	me = view
+	if not _ended():
 		_check_rival(dt)
+		_respawns(dt)
 	_cleanup()
-	_update_camera(dt)
-	_update_floor(dt)
-	_update_fx(dt)
+	_update_world_fx(dt)
+	for o in oozes:
+		me = o
+		_update_camera(dt)
+		_update_floor(dt)
+		_update_fx(dt)
+	me = view
 	_telemetry()
+	if net_mode == "host":
+		_net_send()
 
 	if me.game_over or me.victory:
 		me.end_t += dt
@@ -454,6 +907,41 @@ func _take_shot(tag: String) -> void:
 	img.save_png(name)
 
 
+func _pick(i: int) -> void:
+	# the local player chose a card (online clients send it to the host instead)
+	if net_mode == "client":
+		_net_pick.rpc_id(1, view.pick_serial, i)
+		net.await_serial = view.pick_serial + 1
+		view.pending.pop_front()
+		return
+	me = view
+	_choose(i)
+
+
+func _multi_choices() -> void:
+	for o in oozes:
+		if o.pending.is_empty():
+			continue
+		me = o
+		if apex_test or idle_test:
+			_choose(0)
+		elif o.bot != null:
+			o.choice_wait += 1
+			if o.choice_wait == 1:
+				print("EVENT t=%.2f frame=%d CHOICE %s %s" % [t, frames, o.name, o.pending[0]["title"]])
+			if o.choice_wait > choice_hold:
+				o.choice_wait = 0
+				_choose(o.bot.pick(self, o.pending[0]["options"]))
+	me = view
+
+
+func _take_inbox() -> void:
+	# hits other players landed on this ooze since its last update
+	for h in me.inbox:
+		player_hit(float(h["power"]), h["src"], "ooze")
+	me.inbox.clear()
+
+
 func _read_input() -> void:
 	var m := Vector2.ZERO
 	if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP): m.y -= 1
@@ -469,20 +957,29 @@ func _read_input() -> void:
 
 
 func _unhandled_input(ev: InputEvent) -> void:
-	if not me.pending.is_empty():
+	me = view
+	if not view.pending.is_empty():
 		if ev is InputEventKey and ev.pressed and not ev.echo:
 			var idx: int = ev.keycode - KEY_1
-			if idx >= 0 and idx < me.pending[0]["options"].size():
-				_choose(idx)
+			if idx >= 0 and idx < view.pending[0]["options"].size():
+				_pick(idx)
+				return
 		elif ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_LEFT:
 			for i in card_rects.size():
 				if card_rects[i].has_point(ev.position):
-					_choose(i)
-		return
+					_pick(i)
+					return
+		if not multi():
+			return
 	if ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_LEFT:
-		me.click_world = (ev.position - screen * 0.5 - me.shake_off) / me.zoom + me.cam
+		view.click_world = (ev.position - screen * 0.5 - view.shake_off) / view.zoom + view.cam
+		if net_mode == "client":
+			_net_click.rpc_id(1, view.click_world)
+			view.click_world = Vector2.INF
 	if ev is InputEventKey and ev.pressed and not ev.echo:
-		if ev.keycode == KEY_R and (me.game_over or me.victory):
+		if lobby and (ev.keycode == KEY_ENTER or ev.keycode == KEY_KP_ENTER):
+			_start_match()
+		elif ev.keycode == KEY_R and _ended() and net_mode == "":
 			get_tree().reload_current_scene()
 		elif ev.keycode == KEY_ESCAPE:
 			get_tree().quit()
@@ -589,6 +1086,7 @@ func _on_rank_up(tg: String, silent: bool) -> void:
 
 
 func _choose(i: int) -> void:
+	me.pick_serial += 1
 	var p: Dictionary = me.pending.pop_front()
 	_apply_option(p["options"][clampi(i, 0, p["options"].size() - 1)], false)
 
@@ -924,6 +1422,8 @@ func lurch_cooldown() -> float:
 
 
 func _lurchable(th: Thing) -> bool:
+	if th.oz == me:
+		return false
 	if th == core:
 		return not th.gone and me.R >= TARGET_R
 	if th.gone or th.dead or th.carried or th.grabbed or vis_alpha(th.r) <= 0.0:
@@ -1029,7 +1529,7 @@ func _update_feelers(dt: float) -> void:
 			var bd := INF
 			for list in [props, enemies]:
 				for th: Thing in list:
-					if th.gone or th.dead or th.carried or taken.has(th) or th == me.lurch_target or th.age < 0.0 or th == core:
+					if th.gone or th.dead or th.carried or taken.has(th) or th == me.lurch_target or th.age < 0.0 or th == core or th.oz != null:
 						continue
 					if th.loose >= 0.0 and not has("metal.riveted"):
 						continue
@@ -1230,6 +1730,7 @@ func shed(k: int, world_ang: float) -> void:
 		th.pos = me.ppos + Vector2.from_angle(a) * (me.R + it.r * 0.4)
 		th.vel = Vector2.from_angle(a + rng.randf_range(-0.5, 0.5)) * me.R * rng.randf_range(7.0, 11.0)
 		th.loose = life
+		th.shed_by = me
 		th.area_v = it.area
 		th.was_enemy = it.creature
 		th.rot = a
@@ -1251,6 +1752,9 @@ func _core_breach(label: String) -> void:
 	me.hurt_vignette = 0.6
 	text(me.ppos + Vector2(0, -me.R * 1.6), label, Color(1, 0.3, 0.3), 22)
 	if me.integrity <= 0.0:
+		if multi():
+			_ooze_down(me, "your core gave out")
+			return
 		me.game_over = true
 		print("DEFEAT at T=%.1f (%s)" % [t, label])
 		banner("SINGULARITY COLLAPSED", "R to restart")
@@ -1371,6 +1875,7 @@ func _spawn_bullet(p: Vector2, v: Vector2, life: float, dmg: float, r: float, co
 	b.r = maxf(r, me.R * 0.03)
 	b.col = col
 	b.pierce = pierce
+	b.oz = me
 	bullets.append(b)
 	return b
 
@@ -1491,11 +1996,24 @@ func _setup_zone(i: int) -> void:
 	if hi <= 0.0:
 		me.arena_r = INF
 		me.wall_r = 0.0
-		_spawn_core()
+		if i >= zones_built:
+			zones_built = i + 1
+			_spawn_core()
+		else:
+			banner("THE PLANET CORE", "grow to %s across and consume it before anyone else does" % fmt_len(TARGET_R * 2.0))
 		return
-	var lo := float(me.zone_def["lo"])
 	me.arena_r = ARENA_K * hi
 	me.wall_r = WALL_K * hi
+	# the world is shared: whoever gets here first builds it
+	if i >= zones_built:
+		zones_built = i + 1
+		_build_zone(i)
+	banner(String(me.zone_def["name"]), "the %ss give way at %s across" % [String(me.zone_def["wall"]["name"]).to_lower(), fmt_len(me.wall_r / ABSORB * 2.0)])
+
+
+func _build_zone(i: int) -> void:
+	var lo := float(me.zone_def["lo"])
+	var hi := float(me.zone_def["hi"])
 	var hd := _view_half_diag()
 	# boundary ring: overlapping pieces so there's no gap to squeeze through
 	var wd: Dictionary = me.zone_def["wall"].duplicate()
@@ -1542,7 +2060,6 @@ func _setup_zone(i: int) -> void:
 		_spawn_theme(at, sqrt(lo * hi) * 1.3, true)
 	_place_terrain(i)
 	_spawn_apex()
-	banner(String(me.zone_def["name"]), "the %ss give way at %s across" % [String(me.zone_def["wall"]["name"]).to_lower(), fmt_len(me.wall_r / ABSORB * 2.0)])
 
 
 func _place_terrain(i: int) -> void:
@@ -1713,9 +2230,14 @@ func _apex_reward(e: Thing, how: String) -> void:
 
 func _build_grid() -> void:
 	grid.clear()
-	grid_cell = maxf(me.R * 2.0, 0.0001)
+	var rmin := INF
+	for o in oozes:
+		if not o.down:
+			rmin = minf(rmin, o.R)
+	grid_cell = maxf((rmin if rmin < INF else view.R) * 2.0, 0.0001)
 	max_enemy_r = 0.0
-	me.nearest_enemy_d = INF
+	for o in oozes:
+		o.nearest_enemy_d = INF
 	for e in enemies:
 		if e.dead:
 			continue
@@ -1725,7 +2247,9 @@ func _build_grid() -> void:
 		else:
 			grid[k] = [e]
 		max_enemy_r = maxf(max_enemy_r, e.r)
-		me.nearest_enemy_d = minf(me.nearest_enemy_d, e.pos.distance_to(me.ppos) - e.r)
+		for o in oozes:
+			if e.oz != o:
+				o.nearest_enemy_d = minf(o.nearest_enemy_d, e.pos.distance_to(o.ppos) - e.r)
 
 
 func query(c: Vector2, q: float) -> Array:
@@ -1737,7 +2261,7 @@ func query(c: Vector2, q: float) -> Array:
 	var y1 := floori((c.y + span) / grid_cell)
 	if (x1 - x0) * (y1 - y0) > 400:
 		for e in enemies:
-			if not e.dead and e.pos.distance_to(c) < q + e.r:
+			if not e.dead and e.oz != me and e.pos.distance_to(c) < q + e.r:
 				out.append(e)
 		return out
 	for x in range(x0, x1 + 1):
@@ -1745,7 +2269,7 @@ func query(c: Vector2, q: float) -> Array:
 			var k := Vector2i(x, y)
 			if grid.has(k):
 				for e: Thing in grid[k]:
-					if not e.dead and e.pos.distance_to(c) < q + e.r:
+					if not e.dead and e.oz != me and e.pos.distance_to(c) < q + e.r:
 						out.append(e)
 	return out
 
@@ -1765,6 +2289,9 @@ func hurt(e: Thing, dmg: float) -> void:
 	dmg *= size_falloff(e.r)
 	if e.apex or e.rival:
 		e.dmg_by[dmg_src] = float(e.dmg_by.get(dmg_src, 0.0)) + dmg
+	if e.oz != null:
+		_ooze_hurt(e, dmg)
+		return
 	if e.rival:
 		_rival_hurt(e, dmg)
 		return
@@ -1826,8 +2353,9 @@ func _wander_point(e: Thing) -> Vector2:
 
 func _update_enemies(dt: float) -> void:
 	for e in enemies:
-		if e.dead:
+		if e.dead or e.oz != null:
 			continue
+		me = _nearest_ooze(e.pos)
 		e.age += dt
 		e.flash -= dt
 		e.contact_cd -= dt
@@ -1851,6 +2379,7 @@ func _update_enemies(dt: float) -> void:
 		if e.pos.length() > me.arena_r - me.wall_r - e.r and me.arena_r < INF and e.pos.length() < me.arena_r + me.wall_r * 4.0:
 			e.pos = e.pos.normalized() * (me.arena_r - me.wall_r - e.r)
 			e.wtarget = _wander_point(e)
+	me = view
 	_rival_contacts()
 	# soft separation
 	for e in enemies:
@@ -2010,13 +2539,21 @@ func _update_bullets(dt: float) -> void:
 		b.life -= dt
 		if b.turn > 0.0 and b.hostile:
 			var sp := b.vel.length()
-			b.vel = Vector2.from_angle(lerp_angle(b.vel.angle(), (me.ppos - b.pos).angle(), minf(1.0, b.turn * dt))) * sp
+			b.vel = Vector2.from_angle(lerp_angle(b.vel.angle(), (_nearest_ooze(b.pos).ppos - b.pos).angle(), minf(1.0, b.turn * dt))) * sp
 		b.pos += b.vel * dt
 		if b.hostile:
-			if not (me.game_over or me.victory) and b.pos.distance_to(me.ppos) < me.R + b.r:
-				player_hit(b.power, b.pos, b.src)
-				b.life = -1.0
+			for o in oozes:
+				if o.down or o.game_over or o.victory:
+					continue
+				if b.pos.distance_to(o.ppos) < o.R + b.r:
+					me = o
+					player_hit(b.power, b.pos, b.src)
+					b.life = -1.0
+					break
 		else:
+			me = b.oz if b.oz != null else view
+			if me.down:
+				continue
 			for e: Thing in query(b.pos, b.r):
 				if b.hit.has(e):
 					continue
@@ -2037,6 +2574,7 @@ func _update_bullets(dt: float) -> void:
 				if b.pierce <= 0:
 					b.life = -1.0
 					break
+	me = view
 	bullets = bullets.filter(func(b): return b.life > 0.0)
 
 
@@ -2133,6 +2671,9 @@ func _spawn_core() -> void:
 
 
 func _win_core() -> void:
+	if multi():
+		_end_match(me, "%s consumed the planet core" % me.name)
+		return
 	me.victory = true
 	core.gone = true
 	ring(me.ppos, me.R * 12.0, Color(1, 0.7, 0.3), 1.5)
@@ -2142,9 +2683,177 @@ func _win_core() -> void:
 
 
 func _lose(why: String) -> void:
+	if multi():
+		_ooze_down(me, why)
+		return
 	me.game_over = true
 	print("DEFEAT at T=%.1f (%s)" % [t, why])
 	banner("SINGULARITY COLLAPSED", why)
+
+
+func _end_match(winner: Ooze, why: String) -> void:
+	match_over = true
+	if core != null:
+		core.gone = true
+	print("MATCH OVER at T=%.1f winner=%s (%s) %s" % [t, winner.name if winner != null else "none", why, _ooze_log()])
+	var prev := me
+	for o in oozes:
+		me = o
+		if o == winner:
+			o.victory = true
+			ring(o.ppos, o.R * 12.0, Color(1, 0.7, 0.3), 1.5)
+			o.shake = 1.5
+			banner("CRITICAL MASS ACHIEVED", "you consumed the planet core · %s across" % fmt_len(o.R * 2.0))
+		else:
+			o.game_over = true
+			banner("SINGULARITY COLLAPSED", why)
+	me = prev
+	if winner == view:
+		print("VICTORY at T=%.1f (core eaten at %s)" % [t, fmt_len(view.R * 2.0)])
+	else:
+		print("DEFEAT at T=%.1f (%s)" % [t, why])
+
+
+func _ooze_down(o: Ooze, why: String) -> void:
+	# in a shared match nobody is knocked out for good: you reform, smaller and behind
+	if o.down:
+		return
+	o.down = true
+	o.respawn_t = 30.0
+	o.killer = why
+	o.lurch_state = 0
+	o.lurch_target = null
+	o.feelers.clear()
+	if o.avatar != null:
+		o.avatar.dead = true
+	print("EVENT t=%.2f frame=%d DOWN %s (%s)" % [t, frames, o.name, why])
+	var prev := me
+	me = o
+	banner("YOU WERE CONSUMED", "%s · you reform in 30 seconds" % why)
+	me = prev
+
+
+func _respawns(dt: float) -> void:
+	for o in oozes:
+		o.guard -= dt
+		if not o.down:
+			continue
+		o.respawn_t -= dt
+		if o.respawn_t <= 0.0:
+			_respawn(o)
+	me = view
+
+
+func _respawn(o: Ooze) -> void:
+	# back at a little under the smallest ooze still in the race, tree intact
+	var ref := INF
+	for x in oozes:
+		if x != o and not x.down:
+			ref = minf(ref, x.R)
+	if ref == INF:
+		ref = sched_r()
+	me = o
+	var keep := o.pending.duplicate()
+	o.pending.clear()
+	o.items.clear()
+	o.core_area = 0.0
+	o.core_count = 0
+	o.collapse_idx = 0
+	recompute_size()
+	_seed_hull(maxf(R0, ref * 0.85))
+	o.pending = keep
+	o.integrity = o.max_integrity
+	o.iframes = 3.0
+	o.guard = 5.0
+	o.pvel = Vector2.ZERO
+	o.hit_acc = 0.0
+	o.inbox.clear()
+	# reform somewhere the oozes that can eat you aren't
+	var best := o.ppos
+	var bs := -INF
+	for k in 16:
+		var at := _arena_spawn_point(o.R) if k < 8 else Vector2.from_angle(rng.randf() * TAU) * sqrt(rng.randf()) * minf(o.arena_r * 0.85, _hd_of(o) * 6.0)
+		if at == Vector2.INF:
+			continue
+		var sc := INF
+		for x in oozes:
+			if x != o and not x.down and x.R > o.R * 1.25:
+				sc = minf(sc, at.distance_to(x.ppos) / maxf(_hd_of(x), 1e-6))
+		if sc > bs:
+			bs = sc
+			best = at
+	o.ppos = best
+	var zi := o.zone
+	while zi < Defs.ZONES.size() - 1 and o.R >= float(Defs.ZONES[zi]["hi"]) * WALL_K / ABSORB:
+		zi += 1
+	if zi != o.zone:
+		_setup_zone(zi)
+	o.down = false
+	_sync_avatar(o, 0.0)
+	if o.avatar != null and not enemies.has(o.avatar):
+		enemies.append(o.avatar)
+	print("EVENT t=%.2f frame=%d REFORM %s at %s" % [t, frames, o.name, fmt_len(o.R * 2.0)])
+	banner("YOU REFORM", "%s across · your essence tree survived" % fmt_len(o.R * 2.0))
+
+
+func _eat_ooze(o: Ooze) -> void:
+	# swallowing another player: a feast, and they're out of the race for 30s
+	me.core_area += o.R * o.R / GROWTH * 0.35 * growth_eff()
+	for tg in me.ranks:
+		if rank(tg) > 0:
+			me.essence[tg] = float(me.essence[tg]) + 3.0
+	for tg in tree_by_tag:
+		_gain_essence({"tags": [tg]}, 0.0)
+	me.stats["rival_eaten"] += 1
+	recompute_size()
+	ring(me.ppos, me.R * 6.0, o.accent, 0.8)
+	me.shake = maxf(me.shake, 0.9)
+	print("EVENT t=%.2f frame=%d %s ATE %s" % [t, frames, me.name, o.name])
+	banner("%s CONSUMED" % o.name, "they reform in 30 seconds")
+	_ooze_down(o, "%s ate you" % me.name)
+
+
+func _ooze_contact(e: Thing, n: Vector2, d: float) -> void:
+	# player vs player: bigger eats smaller, evenly matched oozes ram and both bleed
+	var o: Ooze = e.oz
+	var rel := o.R / me.R
+	if rel < 0.8:
+		if o.guard > 0.0:
+			return   # a freshly reformed ooze can't be swallowed straight away
+		_eat_ooze(o)
+		return
+	if rel > 1.25:
+		return   # it eats you on its own update
+	if e.contact_cd <= 0.0 and me.avatar.contact_cd <= 0.0:
+		e.contact_cd = 1.0
+		me.avatar.contact_cd = 1.0
+		me.stats["rival_strikes"] += 1
+		if rel > 1.2:
+			player_hit(1.6 * rel, o.ppos, "ooze")
+		elif rel < 1.0 / 1.2:
+			o.inbox.append({"power": 1.6 / rel, "src": me.ppos})
+		else:
+			player_hit(1.5, o.ppos, "ooze")
+			o.inbox.append({"power": 1.5, "src": me.ppos})
+		me.pvel += n * me.R * 7.0
+		o.pvel -= n * o.R * 7.0
+	var ov := me.R + o.R - d
+	me.ppos += n * ov * 0.5
+	o.ppos -= n * ov * 0.5
+
+
+func _ooze_hurt(e: Thing, dmg: float) -> void:
+	# abilities chip another player's hull the way they chip a rival's mass
+	var o: Ooze = e.oz
+	if o.down or o.iframes > 0.0:
+		return
+	e.flash = 0.06
+	o.hit_acc += dmg * 0.004 / maxf(o.R * o.R, 1e-8)
+	var guard := 0
+	while o.hit_acc >= 0.04 and guard < 4:
+		guard += 1
+		o.hit_acc -= 0.04
+		o.inbox.append({"power": 1.0, "src": me.ppos})
 
 
 func _eat_rival(e: Thing) -> void:
@@ -2314,6 +3023,8 @@ func _rival_contacts() -> void:
 
 
 func _rival_can_eat(e: Thing, th: Thing) -> bool:
+	if th.oz != null:
+		return false   # players are eaten by contact, not by feeding arms
 	if th == core:
 		return not th.gone and e.r >= TARGET_R
 	if th.gone or th.dead or th == e or th.carried or th.grabbed or th.fixed and th.r >= ABSORB * me.R:
@@ -2375,7 +3086,10 @@ func _rival_feed(e: Thing, dt: float) -> void:
 		if d < e.r + tg.r * 0.3:
 			if tg == core:
 				core.gone = true
-				_lose("the rival consumed the planet core")
+				if multi():
+					_end_match(null, "%s consumed the planet core" % e.tag_name)
+				else:
+					_lose("the rival consumed the planet core")
 				return
 			# it grows exactly like you do: same growth curve, same pacing
 			e.hp += GROWTH * tg.r * tg.r * _rival_eff(e)
@@ -2425,6 +3139,7 @@ func _update_props(dt: float) -> void:
 	for p in props:
 		if p.gone:
 			continue
+		me = view
 		p.age += dt
 		if p.vel != Vector2.ZERO:
 			p.pos += p.vel * dt
@@ -2435,6 +3150,7 @@ func _update_props(dt: float) -> void:
 			p.gone = true
 			continue
 		if p.loose >= 0.0:
+			me = p.shed_by if p.shed_by != null else view
 			p.loose -= dt
 			if has("metal.riveted") and p.age > 1.0 and p.r < LOOSE_ABSORB * me.R:
 				p.pos = p.pos.move_toward(me.ppos, me.R * 3.0 * dt_pull)
@@ -2442,6 +3158,7 @@ func _update_props(dt: float) -> void:
 				p.gone = true
 				me.stats["lost"] += 1
 				me.bursts.append({"pos": p.pos, "r": p.r * 6.0, "dmg": 6.0 * p.r * p.r, "col": Color(1.0, 0.5, 0.2)})
+	me = view
 
 
 func _player_collisions() -> void:
@@ -2481,6 +3198,12 @@ func _player_collisions() -> void:
 		if d > me.R + e.r:
 			continue
 		var n := to / maxf(d, 0.000001)
+		if e.oz != null:
+			if e.oz != me:
+				_ooze_contact(e, n, d)
+				if me.down:
+					return
+			continue
 		if e.rival:
 			var rel := e.r / me.R
 			if rel < 0.8:
@@ -2692,7 +3415,7 @@ func _spawning(dt: float) -> void:
 	for p in props:
 		if p.gone or p.loose >= 0.0:
 			continue
-		if p.r < SEE_MIN * me.R:
+		if not _seen_by_any(p.r):
 			p.gone = true
 			_vanish(p)
 			continue
@@ -2700,7 +3423,8 @@ func _spawning(dt: float) -> void:
 			continue
 		var d := p.pos.distance_to(me.ppos)
 		if d > hd * 2.6:
-			p.gone = true
+			if not _near_any(p.pos, 2.6):
+				p.gone = true
 		else:
 			near += 1
 	var guard := 0
@@ -2714,9 +3438,7 @@ func _spawning(dt: float) -> void:
 	var keep_t := []
 	for h in terrain:
 		var d := (h["pos"] as Vector2).distance_to(me.ppos)
-		if h.get("dyn", false) and d > hd * 3.2:
-			continue
-		if terrain_strength(h["r"]) <= 0.0 and d > hd * 1.5:
+		if not _terrain_kept(h):
 			continue
 		keep_t.append(h)
 		if d < hd * 2.6 and terrain_strength(h["r"]) > 0.3:
@@ -2737,16 +3459,16 @@ func _spawning(dt: float) -> void:
 		if e.dead or e.rival or e.apex:
 			continue
 		var d := e.pos.distance_to(me.ppos)
-		if d > hd * 3.0:
+		if d > hd * 3.0 and not _near_any(e.pos, 3.0):
 			e.dead = true
 			e.gone = true
-		elif e.r < SEE_MIN * me.R:
+		elif not _seen_by_any(e.r):
 			e.dead = true
 			_vanish(e)
-		else:
+		elif d <= hd * 3.0 and e.r >= SEE_MIN * me.R:
 			alive += 1
 	for e in apexes:
-		if not e.dead and e.r < SEE_MIN * me.R:
+		if not e.dead and not _seen_by_any(e.r):
 			e.dead = true
 			_vanish(e)
 	me.spawn_acc += dt * (4.0 + 10.0 * p)
@@ -2755,6 +3477,39 @@ func _spawning(dt: float) -> void:
 		if spawn_enemy() != null:
 			alive += 1
 	me.spawn_acc = minf(me.spawn_acc, 3.0)
+
+
+func _seen_by_any(r: float) -> bool:
+	# beneath notice only once it's beneath every ooze in the match
+	for o in oozes:
+		if not o.down and r >= SEE_MIN * o.R:
+			return true
+	return false
+
+
+func _near_any(p: Vector2, k: float) -> bool:
+	for o in oozes:
+		if not o.down and p.distance_to(o.ppos) <= _hd_of(o) * k:
+			return true
+	return false
+
+
+func _hd_of(o: Ooze) -> float:
+	return o.view_r * Vector2(screen.x / screen.y, 1.0).length()
+
+
+func _terrain_kept(h: Dictionary) -> bool:
+	for o in oozes:
+		if o.down:
+			continue
+		var d := (h["pos"] as Vector2).distance_to(o.ppos)
+		var hd := _hd_of(o)
+		if h.get("dyn", false) and d > hd * 3.2:
+			continue
+		if clampf((float(h["r"]) / o.R - SEE_MIN) / 0.5, 0.0, 1.0) <= 0.0 and d > hd * 1.5:
+			continue
+		return true
+	return false
 
 
 func _vanish(th: Thing) -> void:
@@ -2825,7 +3580,7 @@ func _update_zoom() -> void:
 	me.zoom = screen.y * 0.5 / me.view_r
 
 
-func _update_fx(dt: float) -> void:
+func _update_world_fx(dt: float) -> void:
 	for arr in [fx_beams, fx_bolts, fx_cones, fx_rings, fx_texts]:
 		for f in arr:
 			f["t"] -= dt
@@ -2834,8 +3589,11 @@ func _update_fx(dt: float) -> void:
 	fx_cones = fx_cones.filter(func(f): return f["t"] > 0.0)
 	fx_rings = fx_rings.filter(func(f): return f["t"] > 0.0)
 	for f in fx_texts:
-		f["pos"] += Vector2(0, -me.R * 0.8) * dt
+		f["pos"] += Vector2(0, -view.R * 0.8) * dt
 	fx_texts = fx_texts.filter(func(f): return f["t"] > 0.0)
+
+
+func _update_fx(dt: float) -> void:
 	for s in me.sparks:
 		s["t"] -= dt
 	me.sparks = me.sparks.filter(func(s): return s["t"] > 0.0)
@@ -2893,6 +3651,15 @@ func _rival_log() -> String:
 	return " RIVALS r/R=[%s] reforming=%d" % [",".join(parts), rival_slots.size()]
 
 
+func _ooze_log() -> String:
+	if not multi():
+		return ""
+	var parts := []
+	for o in oozes:
+		parts.append("%s:%s%s" % [o.name, fmt_len(o.R * 2.0), "(down)" if o.down else ""])
+	return " OOZES=[%s]" % ", ".join(parts)
+
+
 func _print_log() -> void:
 	var alive := 0
 	for e in enemies:
@@ -2909,7 +3676,7 @@ func _print_log() -> void:
 	print("T=%5.1f D=%s zone=%d%s surf=%d integ=%.2f imb=%.2f en=%d props=%d ranks=%s %s%s%s" % [
 		t, fmt_len(me.R * 2.0), me.zone, "(open)" if me.zone_open else "", surface_count(), me.integrity, me.imbalance,
 		alive, props.size(), " ".join(rk), str(me.stats), ap,
-		_rival_log()])
+		_rival_log() + _ooze_log()])
 
 
 # =============================================================================
@@ -2917,12 +3684,12 @@ func _print_log() -> void:
 # =============================================================================
 
 func w2s(p: Vector2) -> Vector2:
-	return (p - me.cam) * me.zoom + screen * 0.5 + me.shake_off
+	return (p - view.cam) * view.zoom + screen * 0.5 + view.shake_off
 
 
 func _on_screen(p: Vector2, r: float) -> bool:
 	var s := w2s(p)
-	var rr := r * me.zoom
+	var rr := r * view.zoom
 	return s.x > -rr and s.y > -rr and s.x < screen.x + rr and s.y < screen.y + rr
 
 
@@ -2957,13 +3724,33 @@ func _branch_col(d: Dictionary) -> Color:
 
 
 func _draw() -> void:
+	if net_mode == "client" and (net == null or not net.got_snap):
+		draw_rect(Rect2(Vector2.ZERO, screen), Color(0.05, 0.04, 0.07))
+		_hud_text(Vector2(40, screen.y * 0.5), "CRITICAL MASS · " + net_status, 22, Color(0.85, 0.75, 1.0))
+		return
+	me = view
 	_draw_grid()
 	_draw_terrain()
-	_draw_patches()
+	for o in oozes:
+		me = o
+		_draw_patches()
+	me = view
 	_draw_props()
-	_draw_strikes()
+	for o in oozes:
+		me = o
+		_draw_strikes()
+	me = view
 	_draw_enemies()
-	_draw_player()
+	# other players first, then you on top
+	for o in oozes:
+		if o == view or o.down or vis_alpha(o.R) <= 0.0:
+			continue
+		me = o
+		_draw_player()
+		_label(w2s(o.ppos), o.name, o.R * view.zoom * 0.6, o.accent.lightened(0.2))
+	me = view
+	if not view.down:
+		_draw_player()
 	_draw_fx()
 	if me.hurt_vignette > 0.0:
 		var a := me.hurt_vignette / 0.6
@@ -2979,10 +3766,10 @@ func _draw_grid() -> void:
 	# outside the current zone is in shadow; the arena itself is lit floor
 	if me.arena_r < INF:
 		draw_rect(Rect2(Vector2.ZERO, screen), me.floor_col.darkened(0.45))
-		draw_circle(w2s(Vector2.ZERO), me.arena_r * me.zoom, me.floor_col)
+		draw_circle(w2s(Vector2.ZERO), me.arena_r * view.zoom, me.floor_col)
 	else:
 		draw_rect(Rect2(Vector2.ZERO, screen), me.floor_col)
-	var span := me.view_r * 2.0
+	var span := view.view_r * 2.0
 	var s := pow(10.0, floorf(log(span / 4.0) / log(10.0)))
 	for level in 2:
 		var step := s * (10.0 if level == 1 else 1.0)
@@ -2991,8 +3778,8 @@ func _draw_grid() -> void:
 		if alpha <= 0.005:
 			continue
 		var col := Color(me.floor_col.darkened(0.35), alpha * 2.2)
-		var tl := me.cam - screen * 0.5 / me.zoom
-		var br := me.cam + screen * 0.5 / me.zoom
+		var tl := view.cam - screen * 0.5 / view.zoom
+		var br := view.cam + screen * 0.5 / view.zoom
 		var x := floorf(tl.x / step) * step
 		while x <= br.x:
 			var sx := w2s(Vector2(x, 0)).x
@@ -3005,7 +3792,7 @@ func _draw_grid() -> void:
 			y += step
 	# outside the current zone is darker: you're not supposed to be there yet
 	var bar_m := s
-	var px := bar_m * me.zoom
+	var px := bar_m * view.zoom
 	var o := Vector2(screen.x - 30 - px, screen.y - 28)
 	draw_line(o, o + Vector2(px, 0), Color(1, 1, 1, 0.6), 2.0)
 	draw_line(o + Vector2(0, -5), o + Vector2(0, 5), Color(1, 1, 1, 0.6), 2.0)
@@ -3024,7 +3811,7 @@ func _draw_terrain() -> void:
 		var td: Dictionary = Defs.TERRAIN[h["type"]]
 		var col: Color = td["col"]
 		var c := w2s(h["pos"])
-		var sr := hr * me.zoom
+		var sr := hr * view.zoom
 		var sd: float = h["seed"]
 		var pts := PackedVector2Array()
 		for j in 20:
@@ -3058,7 +3845,7 @@ func _draw_patches() -> void:
 		if not _on_screen(pt["pos"], pt["r"]):
 			continue
 		var a: float = clampf(pt["t"] / 2.5, 0.0, 1.0)
-		draw_circle(w2s(pt["pos"]), pt["r"] * me.zoom, Color(1.0, 0.4, 0.1, 0.25 * a))
+		draw_circle(w2s(pt["pos"]), pt["r"] * view.zoom, Color(1.0, 0.4, 0.1, 0.25 * a))
 
 
 func _draw_props() -> void:
@@ -3068,10 +3855,10 @@ func _draw_props() -> void:
 		if p == core:
 			var cc := w2s(p.pos)
 			var pulse := 0.5 + 0.5 * sin(t * 2.0)
-			draw_circle(cc, p.r * me.zoom * (1.35 + 0.05 * pulse), Color(1.0, 0.45, 0.1, 0.12))
-			draw_circle(cc, p.r * me.zoom * 1.15, Color(1.0, 0.55, 0.15, 0.18))
+			draw_circle(cc, p.r * view.zoom * (1.35 + 0.05 * pulse), Color(1.0, 0.45, 0.1, 0.12))
+			draw_circle(cc, p.r * view.zoom * 1.15, Color(1.0, 0.55, 0.15, 0.18))
 		var c := w2s(p.pos)
-		var sr := p.r * me.zoom
+		var sr := p.r * view.zoom
 		var fill: Color = p.d["col"]
 		var sh: int = int(p.d.get("sh", 0))
 		var edible := p.r < ABSORB * me.R or (p.loose >= 0.0 and p.r < LOOSE_ABSORB * me.R)
@@ -3115,7 +3902,7 @@ func _draw_props() -> void:
 func _draw_strikes() -> void:
 	for s in me.strikes:
 		var c := w2s(s["pos"])
-		var sr: float = s["r"] * me.zoom
+		var sr: float = s["r"] * view.zoom
 		var f: float = 1.0 - s["t"] / s["tm"]
 		draw_circle(c, sr * f, Color(1.0, 0.2, 0.15, 0.18))
 		draw_arc(c, sr, 0, TAU, 48, Color(1.0, 0.3, 0.2, 0.8), 2.0)
@@ -3131,7 +3918,7 @@ func _draw_enemies() -> void:
 			_draw_boss(e)
 			continue
 		var c := w2s(e.pos)
-		var sr := e.r * me.zoom * clampf(e.age / 0.4, 0.05, 1.0)
+		var sr := e.r * view.zoom * clampf(e.age / 0.4, 0.05, 1.0)
 		var fill: Color = e.d["col"]
 		if e.flash > 0.0:
 			fill = fill.lerp(Color(1, 1, 1), 0.5)
@@ -3146,7 +3933,7 @@ func _draw_enemies() -> void:
 			draw_arc(c, sr * 1.25, 0, TAU, 48, Color(1.0, 0.2, 0.15, 0.3 + 0.5 * pulse * (1.0 if e.state == 1 else 0.4)), maxf(2.0, sr * 0.08))
 			if e.state == 0:
 				# sight radius, so you can sneak around it
-				draw_arc(c, (e.r * 3.5 + me.R * 6.0) * me.zoom, 0, TAU, 64, Color(1.0, 0.3, 0.2, 0.12), 1.5)
+				draw_arc(c, (e.r * 3.5 + me.R * 6.0) * view.zoom, 0, TAU, 64, Color(1.0, 0.3, 0.2, 0.12), 1.5)
 		elif e.elite:
 			outline = Color(1.0, 0.8, 0.2)
 			draw_arc(c, sr * 1.18, 0, TAU, 24, Color(1.0, 0.8, 0.2, 0.35), maxf(1.0, sr * 0.05))
@@ -3189,7 +3976,7 @@ func _draw_enemies() -> void:
 func _draw_boss(e: Thing) -> void:
 	# a rival ooze: same body as yours, crimson-black, its own feeding arms
 	var c := w2s(e.pos)
-	var sr := e.r * me.zoom
+	var sr := e.r * view.zoom
 	var tents := []
 	var i := 0
 	for f in e.feelers:
@@ -3263,7 +4050,7 @@ func _draw_tentacle(origin: Vector2, rad: float, tip: Vector2, w0: float, latche
 	right.reverse()
 	left.append_array(right)
 	draw_colored_polygon(left, skin)
-	draw_circle(w2s(tip), maxf(2.0, rad * w0 * 0.55 * me.zoom), skin)
+	draw_circle(w2s(tip), maxf(2.0, rad * w0 * 0.55 * view.zoom), skin)
 	# cells stream out to forage, then back along a latched arm carrying food
 	for k in 3:
 		var u := fposmod(t * 1.4 + k / 3.0 + seed * 0.37, 1.0)
@@ -3271,12 +4058,12 @@ func _draw_tentacle(origin: Vector2, rad: float, tip: Vector2, w0: float, latche
 			u = 1.0 - u
 		var idx := clampi(int(u * n), 0, n)
 		var cp: Vector2 = pts[idx]
-		draw_circle(w2s(cp), maxf(1.5, rad * w0 * 0.35 * me.zoom), cell)
+		draw_circle(w2s(cp), maxf(1.5, rad * w0 * 0.35 * view.zoom), cell)
 
 
 func _membrane(origin: Vector2, rad: float, vel: Vector2, ang: float, tents: Array, shrink: float) -> PackedVector2Array:
 	var c := w2s(origin)
-	var sr := rad * me.zoom
+	var sr := rad * view.zoom
 	var sp := vel.length()
 	var st := clampf(sp / maxf(max_speed() * 5.0, 0.0001), 0.0, 0.32)
 	var va := vel.angle()
@@ -3299,14 +4086,14 @@ func _membrane(origin: Vector2, rad: float, vel: Vector2, ang: float, tents: Arr
 
 func _draw_player() -> void:
 	var c := w2s(me.ppos)
-	var sr := me.R * me.zoom
+	var sr := me.R * view.zoom
 	if has("fire.halo") or has("fire.inferno"):
-		var er := me.R * (3.2 if has("fire.inferno") else 1.9) * me.zoom
+		var er := me.R * (3.2 if has("fire.inferno") else 1.9) * view.zoom
 		draw_circle(c, er, Color(1.0, 0.45, 0.1, 0.07))
 		draw_arc(c, er * (0.97 + 0.03 * sin(t * 9.0)), 0, TAU, 48, Color(1.0, 0.5, 0.15, 0.45), 2.0)
 	for s in me.sparks:
 		var a: float = s["t"] / 2.5
-		draw_circle(w2s(s["pos"]), maxf(1.5, s["r"] * me.zoom * 0.25), Color(0.5, 0.9, 1.0, a * 0.8))
+		draw_circle(w2s(s["pos"]), maxf(1.5, s["r"] * view.zoom * 0.25), Color(0.5, 0.9, 1.0, a * 0.8))
 	if me.syn_active.has("blender"):
 		var n: int = 2 + me.syn_active["blender"]["links"].size()
 		for i in n:
@@ -3320,18 +4107,18 @@ func _draw_player() -> void:
 			_shape(4, bp, sr * 0.3, me.blade_ang * 2.0 + i, Color(0.85, 0.85, 1.0), Color(0, 0, 0, 0.6), 1.0)
 	for cr in me.critters:
 		var cp := w2s(cr["pos"])
-		draw_circle(cp, maxf(3.0, sr * 0.16), OOZE)
+		draw_circle(cp, maxf(3.0, sr * 0.16), me.skin)
 		draw_circle(cp, maxf(1.5, sr * 0.07), Color(0.55, 0.95, 0.45))
 	var tents := _tentacles()
 	for tt in tents:
-		_draw_tentacle(me.ppos, me.R, tt["tip"], tt["w"], tt["latched"], tt["seed"], OOZE, Color(0.32, 0.22, 0.42, 0.9))
+		_draw_tentacle(me.ppos, me.R, tt["tip"], tt["w"], tt["latched"], tt["seed"], me.skin, me.cell)
 	# hull pieces sit half-sunk in the ooze: draw them, then the membrane over their inner half
 	for it in me.items:
 		if not it.surface:
 			continue
 		var a := me.hull_ang + it.ang
 		var p := w2s(me.ppos + Vector2.from_angle(a) * (me.R + it.r * 0.25))
-		var isr := it.r * me.zoom
+		var isr := it.r * view.zoom
 		var col: Color = it.d["col"]
 		if it.creature:
 			var wig := sin(t * 14.0 + it.wob) * 0.6
@@ -3341,7 +4128,7 @@ func _draw_player() -> void:
 		var bc := _branch_col(it.d)
 		_shape(int(it.d.get("sh", 0)) if not it.creature else 0, p, isr, a, col, bc if bc.a > 0.0 else Color(0, 0, 0, 0.6), maxf(1.0, isr * (0.14 if bc.a > 0.0 else 0.08)))
 	var body := _membrane(me.ppos, me.R, me.pvel, me.hull_ang, tents, 1.0)
-	draw_colored_polygon(body, OOZE)
+	draw_colored_polygon(body, me.skin)
 	# what's inside: buried junk as faint silhouettes and the crushed core's glow
 	var bi := 0
 	for it in me.items:
@@ -3353,7 +4140,7 @@ func _draw_player() -> void:
 		var a := me.hull_ang + it.ang
 		var rr := sr * (0.2 + 0.6 * fposmod(it.wob, 1.0))
 		var col: Color = it.d["col"]
-		draw_circle(c + Vector2.from_angle(a) * rr, maxf(1.0, it.r * me.zoom * 0.6), Color(col.darkened(0.6), 0.16))
+		draw_circle(c + Vector2.from_angle(a) * rr, maxf(1.0, it.r * view.zoom * 0.6), Color(col.darkened(0.6), 0.16))
 	var core_frac := clampf(me.core_area / maxf(me.R * me.R / GROWTH, 0.0001), 0.0, 1.0)
 	draw_circle(c, sr * 0.42 * (0.6 + core_frac), Color(0.45, 0.18, 0.65, 0.14 + 0.2 * core_frac))
 	draw_circle(c, sr * 0.2 * (0.6 + core_frac), Color(0.75, 0.4, 1.0, 0.18 + 0.35 * core_frac))
@@ -3374,12 +4161,14 @@ func _draw_player() -> void:
 	draw_circle(c + Vector2.from_angle(PI * 1.3) * sr * 0.55, maxf(1.5, sr * 0.07), Color(1, 1, 1, 0.45))
 	body.append(body[0])
 	var hurt_flash := me.iframes > 0.0 and int(me.iframes * 16) % 2 == 0
-	draw_polyline(body, Color(1.0, 0.25, 0.3, 0.9) if hurt_flash else Color(0, 0, 0, 0.85), maxf(1.5, sr * (0.07 if hurt_flash else 0.03)))
+	# other players get a rim in their colour so you can tell oozes apart at a glance
+	var rim := Color(0, 0, 0, 0.85) if me == view else Color(me.accent, 0.85)
+	draw_polyline(body, Color(1.0, 0.25, 0.3, 0.9) if hurt_flash else rim, maxf(1.5, sr * (0.07 if hurt_flash else (0.03 if me == view else 0.05))))
 	for it in me.items:
 		if it.surface:
 			var p := w2s(me.ppos + Vector2.from_angle(me.hull_ang + it.ang) * (me.R + it.r * 0.25))
 			var col: Color = it.d["col"]
-			_label(p + Vector2.from_angle(me.hull_ang + it.ang) * it.r * me.zoom * 0.3, String(it.d["lbl"]), it.r * me.zoom, Color(0, 0, 0, 0.75) if col.get_luminance() > 0.45 else Color(1, 1, 1, 0.85))
+			_label(p + Vector2.from_angle(me.hull_ang + it.ang) * it.r * view.zoom * 0.3, String(it.d["lbl"]), it.r * view.zoom, Color(0, 0, 0, 0.75) if col.get_luminance() > 0.45 else Color(1, 1, 1, 0.85))
 	for id in me.syn_active:
 		var sa: Dictionary = me.syn_active[id]
 		var cp := w2s(item_world(sa["cat"])[0])
@@ -3399,6 +4188,9 @@ func _draw_player() -> void:
 		draw_circle(c + Vector2.from_angle(ha) * sr * 0.6, maxf(3.0, sr * me.imbalance * 0.5), Color(1.0, 0.8, 0.3, 0.6))
 	if me.burst_t > 0.0:
 		draw_arc(c, sr * 1.6, me.hull_ang, me.hull_ang + PI * 1.5, 32, Color(0.25, 0.15, 0.35, 0.7), 3.0)
+	if me.guard > 0.0:
+		# freshly reformed: a shimmering shell nobody can swallow yet
+		draw_arc(c, sr * (1.25 + 0.04 * sin(t * 8.0)), 0, TAU, 48, Color(me.accent, 0.35 + 0.3 * minf(me.guard, 1.0)), maxf(2.0, sr * 0.05))
 
 
 func _draw_fx() -> void:
@@ -3406,7 +4198,7 @@ func _draw_fx() -> void:
 		if not _on_screen(b.pos, b.r):
 			continue
 		var c := w2s(b.pos)
-		var sr := maxf(b.r * me.zoom, 2.0 if b.hostile else 1.5)
+		var sr := maxf(b.r * view.zoom, 2.0 if b.hostile else 1.5)
 		if b.hostile:
 			draw_circle(c, sr + 1.5, Color(0.3, 0, 0))
 			draw_circle(c, sr, b.col)
@@ -3414,10 +4206,10 @@ func _draw_fx() -> void:
 			draw_line(c, c - b.vel.normalized() * maxf(sr * 3.0, 5.0), b.col, maxf(1.5, sr))
 	for f in fx_beams:
 		var a: float = f["t"] / 0.1
-		draw_line(w2s(f["a"]), w2s(f["b"]), Color(f["col"], 0.75 * a), maxf(1.5, f["w"] * me.zoom * 2.0))
+		draw_line(w2s(f["a"]), w2s(f["b"]), Color(f["col"], 0.75 * a), maxf(1.5, f["w"] * view.zoom * 2.0))
 	for f in fx_cones:
 		var p := w2s(f["pos"])
-		var L: float = f["len"] * me.zoom
+		var L: float = f["len"] * view.zoom
 		var pts := PackedVector2Array([p, p + Vector2.from_angle(f["a"] - f["half"]) * L, p + Vector2.from_angle(f["a"]) * L * 1.05, p + Vector2.from_angle(f["a"] + f["half"]) * L])
 		draw_colored_polygon(pts, Color(f["col"], 0.22))
 	for f in fx_bolts:
@@ -3427,7 +4219,7 @@ func _draw_fx() -> void:
 		draw_polyline(pts, f["col"], 2.0)
 	for f in fx_rings:
 		var k: float = 1.0 - f["t"] / f["tm"]
-		draw_arc(w2s(f["pos"]), f["r"] * me.zoom * (0.3 + 0.7 * k), 0, TAU, 40, Color(f["col"], (1.0 - k) * f["col"].a), 3.0)
+		draw_arc(w2s(f["pos"]), f["r"] * view.zoom * (0.3 + 0.7 * k), 0, TAU, 40, Color(f["col"], (1.0 - k) * f["col"].a), 3.0)
 	for dd in me.dust:
 		draw_circle(w2s(dd["pos"]), 1.5, Color(0.8, 0.7, 1.0, 0.8))
 	for f in fx_texts:
@@ -3458,7 +4250,8 @@ func _draw_hud() -> void:
 		zl += ("  ·  WALLS EDIBLE — BREAK OUT" if me.zone_open else "  ·  exit at %s" % fmt_len(me.wall_r / ABSORB * 2.0))
 	_hud_text(Vector2(16, 84), zl, 14, Color(0.6, 1.0, 0.7) if me.zone_open else Color(0.7, 0.6, 1.0))
 	var sc := surface_count()
-	_hud_text(Vector2(16, 106), "hull %d live · %d buried · core %d" % [sc, me.items.size() - sc, me.core_count], 14, Color(0.8, 0.8, 0.85))
+	var total := me.net_items if me.net_items >= 0 else me.items.size()
+	_hud_text(Vector2(16, 106), "hull %d live · %d buried · core %d" % [sc, total - sc, me.core_count], 14, Color(0.8, 0.8, 0.85))
 	for i in int(me.max_integrity):
 		var part := clampf(me.integrity - i, 0.0, 1.0)
 		var c := Vector2(24 + i * 22, 124)
@@ -3486,11 +4279,13 @@ func _draw_hud() -> void:
 	var bw := 420.0
 	var bx := (screen.x - bw) * 0.5
 	var ry := screen.y - 40.0
-	for e in rivals:
+	for e: Thing in rivals + other_avatars():
 		if e.dead:
 			continue
 		var ratio := e.r / me.R
 		var band := "you can EAT it" if ratio < 0.8 else ("EVEN: rams hurt you both" if ratio <= 1.2 else ("BIGGER: it hunts you" if me.R >= e.r * ABSORB_LIVE * 1.25 else "HUGE: it can EAT you"))
+		if e.oz != null:
+			band = "you can EAT them" if ratio < 0.8 else ("EVEN: rams hurt you both" if ratio <= 1.25 else "BIGGER: they can EAT you")
 		var bcol := Color(0.55, 1.0, 0.65) if ratio < 0.8 else (Color(1.0, 0.85, 0.4) if ratio <= 1.2 else Color(1.0, 0.35, 0.4))
 		draw_circle(Vector2(bx - 12, ry - 5), 6, e.accent)
 		_hud_text(Vector2(bx, ry), "%s  %.2fx your size — %s" % [e.tag_name, ratio, band], 14, bcol)
@@ -3499,6 +4294,10 @@ func _draw_hud() -> void:
 		draw_line(Vector2(bx + bw * 0.32, ry + 5), Vector2(bx + bw * 0.32, ry + 17), Color(0.5, 1, 0.6), 2.0)
 		draw_line(Vector2(bx + bw * 0.48, ry + 5), Vector2(bx + bw * 0.48, ry + 17), Color(1, 0.4, 0.4), 2.0)
 		ry -= 30.0
+	for o in oozes:
+		if o != view and o.down:
+			_hud_text(Vector2(bx, ry), "%s reforming in %ds" % [o.name, int(maxf(o.respawn_t, 0.0))], 13, Color(0.7, 0.6, 0.65))
+			ry -= 20.0
 	for sl in rival_slots:
 		var look: Dictionary = RIVAL_LOOKS[int(sl["slot"]) % RIVAL_LOOKS.size()]
 		_hud_text(Vector2(bx, ry), "%s reforming in %ds" % [look["name"] if rival_count > 1 else "RIVAL", int(maxf(float(sl["t"]), 0.0))], 13, Color(0.7, 0.6, 0.65))
@@ -3515,6 +4314,20 @@ func _draw_hud() -> void:
 		draw_string_outline(font, Vector2((screen.x - w2) * 0.5, by + 24), sub, HORIZONTAL_ALIGNMENT_LEFT, -1, 15, 4, Color(0, 0, 0, a))
 		draw_string(font, Vector2((screen.x - w2) * 0.5, by + 24), sub, HORIZONTAL_ALIGNMENT_LEFT, -1, 15, Color(0.85, 0.85, 0.9, a))
 		by += 74
+	if lobby:
+		var open := 0
+		for o in oozes:
+			if o != view and o.peer == 0:
+				open += 1
+		var lm := "HOSTING ON PORT %d · %d/%d PLAYERS · ENTER TO START (AUTOPILOT FILLS EMPTY SLOTS)" % [net_port, players - open, players]
+		var lw := font.get_string_size(lm, HORIZONTAL_ALIGNMENT_LEFT, -1, 18).x
+		_hud_text(Vector2((screen.x - lw) * 0.5, screen.y * 0.45), lm, 18, Color(0.9, 0.85, 1.0))
+	if view.down:
+		var msg := "REFORMING IN %d" % int(ceilf(view.respawn_t))
+		var mw := font.get_string_size(msg, HORIZONTAL_ALIGNMENT_LEFT, -1, 40).x
+		_hud_text(Vector2((screen.x - mw) * 0.5, screen.y * 0.5), msg, 40, view.accent)
+		var mw2 := font.get_string_size(view.killer, HORIZONTAL_ALIGNMENT_LEFT, -1, 16).x
+		_hud_text(Vector2((screen.x - mw2) * 0.5, screen.y * 0.5 + 28), view.killer, 16, Color(0.85, 0.8, 0.9))
 	if not bot_mode:
 		_hud_text(Vector2(16, screen.y - 14), "WASD crawl · SPACE / click lurch · SHIFT churn · Q/E nudge spin · F12 screenshot", 12, Color(0.6, 0.6, 0.65))
 	else:
@@ -3564,6 +4377,7 @@ func _draw_tree_panel() -> void:
 
 func _draw_apex_markers() -> void:
 	var marks: Array = apexes.duplicate()
+	marks.append_array(other_avatars())
 	for e in rivals:
 		if not e.dead:
 			marks.append(e)
@@ -3599,14 +4413,21 @@ func _draw_apex_markers() -> void:
 
 
 func _draw_choice() -> void:
-	draw_rect(Rect2(Vector2.ZERO, screen), Color(0, 0, 0, 0.55))
+	# solo: the world pauses behind a dimmed screen. Shared: cards sit low and play goes on
+	var y0 := screen.y * 0.3
+	if multi():
+		y0 = screen.y * 0.56
+	else:
+		draw_rect(Rect2(Vector2.ZERO, screen), Color(0, 0, 0, 0.55))
 	var p: Dictionary = me.pending[0]
 	var title: String = p["title"]
 	var w := font.get_string_size(title, HORIZONTAL_ALIGNMENT_LEFT, -1, 30).x
-	_hud_text(Vector2((screen.x - w) * 0.5, screen.y * 0.3), title, 30, Color(1, 0.95, 1))
+	_hud_text(Vector2((screen.x - w) * 0.5, y0), title, 30, Color(1, 0.95, 1))
 	var sub: String = p.get("sub", "")
+	if multi():
+		sub += "  ·  press 1-%d" % p["options"].size()
 	var w2 := font.get_string_size(sub, HORIZONTAL_ALIGNMENT_LEFT, -1, 15).x
-	_hud_text(Vector2((screen.x - w2) * 0.5, screen.y * 0.3 + 26), sub, 15, Color(0.8, 0.8, 0.85))
+	_hud_text(Vector2((screen.x - w2) * 0.5, y0 + 26), sub, 15, Color(0.8, 0.8, 0.85))
 	var opts: Array = p["options"]
 	var cw := 300.0
 	var ch := 120.0
@@ -3616,7 +4437,7 @@ func _draw_choice() -> void:
 	card_rects.clear()
 	for i in opts.size():
 		var o: Dictionary = opts[i]
-		var r := Rect2(x0 + i * (cw + gap), screen.y * 0.42, cw, ch)
+		var r := Rect2(x0 + i * (cw + gap), y0 + screen.y * 0.12, cw, ch)
 		card_rects.append(r)
 		var col: Color = o["col"]
 		draw_rect(r, Color(0.1, 0.1, 0.14, 0.95))
