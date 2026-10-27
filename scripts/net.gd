@@ -147,7 +147,7 @@ func encode(g, o) -> PackedByteArray:
 	var slots := []
 	for sl in g.rival_slots:
 		slots.append([sl["slot"], sl["t"]])
-	var snap := [g.t, g.match_over, g.rival_count, slots, mine, oz, pi, pf, ei, ef, feel, bf, tf, fx, strikes, patches]
+	var snap := [g.t, g.match_over, g.rival_count, slots, mine, oz, pi, pf, ei, ef, feel, bf, tf, fx, strikes, patches, g.lobby]
 	var raw := var_to_bytes(snap)
 	var out := PackedByteArray()
 	out.resize(4)
@@ -222,6 +222,7 @@ func apply(g, bytes: PackedByteArray) -> void:
 	_apply_mine(g, snap[4])
 	for row in snap[5]:
 		_apply_ooze(g, row)
+	g.lobby = snap[16]
 	_apply_props(g, snap[6], snap[7])
 	_apply_enemies(g, snap[8], snap[9], snap[10])
 	g.bullets.clear()

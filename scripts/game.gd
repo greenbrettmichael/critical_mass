@@ -751,7 +751,7 @@ func _ended() -> bool:
 	return match_over if multi() else (view.game_over or view.victory)
 
 
-func _seed_hull(target_r: float) -> void:
+func _seed_hull(target_r: float, feed: bool = true) -> void:
 	# Debug: grow to target radius with a plausible hull for testing later zones.
 	while me.R < target_r:
 		var s := me.R * exp(rng.randf_range(log(0.12), log(0.45)))
@@ -765,7 +765,8 @@ func _seed_hull(target_r: float) -> void:
 		it.wob = rng.randf() * TAU
 		place_item(it)
 		me.items.append(it)
-		_gain_essence(d, 0.06, true)
+		if feed:
+			_gain_essence(d, 0.06, true)
 		recompute_size()
 		while me.collapse_idx < COLLAPSES.size() and me.R >= COLLAPSES[me.collapse_idx]:
 			do_collapse(true)
@@ -854,6 +855,8 @@ func _physics_process(dt: float) -> void:
 		_process_bursts()
 	for o in live_oozes():
 		me = o
+		if me.down:
+			continue   # eaten earlier in this same pass
 		if not (me.game_over or me.victory):
 			_player_collisions()
 			if me.down:
@@ -977,7 +980,7 @@ func _unhandled_input(ev: InputEvent) -> void:
 			_net_click.rpc_id(1, view.click_world)
 			view.click_world = Vector2.INF
 	if ev is InputEventKey and ev.pressed and not ev.echo:
-		if lobby and (ev.keycode == KEY_ENTER or ev.keycode == KEY_KP_ENTER):
+		if lobby and net_mode == "host" and (ev.keycode == KEY_ENTER or ev.keycode == KEY_KP_ENTER):
 			_start_match()
 		elif ev.keycode == KEY_R and _ended() and net_mode == "":
 			get_tree().reload_current_scene()
@@ -2760,7 +2763,7 @@ func _respawn(o: Ooze) -> void:
 	o.core_count = 0
 	o.collapse_idx = 0
 	recompute_size()
-	_seed_hull(maxf(R0, ref * 0.85))
+	_seed_hull(maxf(R0, ref * 0.85), false)
 	o.pending = keep
 	o.integrity = o.max_integrity
 	o.iframes = 3.0
@@ -2854,6 +2857,7 @@ func _ooze_hurt(e: Thing, dmg: float) -> void:
 		guard += 1
 		o.hit_acc -= 0.04
 		o.inbox.append({"power": 1.0, "src": me.ppos})
+		me.stats["pvp_hits"] = int(me.stats.get("pvp_hits", 0)) + 1
 
 
 func _eat_rival(e: Thing) -> void:
@@ -3656,7 +3660,7 @@ func _ooze_log() -> String:
 		return ""
 	var parts := []
 	for o in oozes:
-		parts.append("%s:%s%s" % [o.name, fmt_len(o.R * 2.0), "(down)" if o.down else ""])
+		parts.append("%s:%s%s hits=%d" % [o.name, fmt_len(o.R * 2.0), "(down)" if o.down else "", int(o.stats.get("pvp_hits", 0))])
 	return " OOZES=[%s]" % ", ".join(parts)
 
 
@@ -4314,7 +4318,11 @@ func _draw_hud() -> void:
 		draw_string_outline(font, Vector2((screen.x - w2) * 0.5, by + 24), sub, HORIZONTAL_ALIGNMENT_LEFT, -1, 15, 4, Color(0, 0, 0, a))
 		draw_string(font, Vector2((screen.x - w2) * 0.5, by + 24), sub, HORIZONTAL_ALIGNMENT_LEFT, -1, 15, Color(0.85, 0.85, 0.9, a))
 		by += 74
-	if lobby:
+	if net_mode == "client" and lobby:
+		var wm := "WAITING FOR THE HOST TO START"
+		var ww := font.get_string_size(wm, HORIZONTAL_ALIGNMENT_LEFT, -1, 18).x
+		_hud_text(Vector2((screen.x - ww) * 0.5, screen.y * 0.45), wm, 18, Color(0.9, 0.85, 1.0))
+	elif lobby:
 		var open := 0
 		for o in oozes:
 			if o != view and o.peer == 0:
